@@ -127,28 +127,28 @@ export default function SyncModal({
   };
 
   return (
-    <div className="fixed inset-0 bg-black/80 backdrop-blur-sm flex items-center justify-center z-50 p-4 animate-fade-in">
+    <div className="fixed inset-0 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center z-50 p-4 animate-fade-in">
       <div 
-        className="bg-[#080B12] border border-white/10 rounded-2xl w-full max-w-2xl overflow-hidden shadow-[0_0_50px_rgba(37,99,235,0.15)] flex flex-col max-h-[90vh]"
+        className="bg-[var(--cor-card-fundo)] border border-[var(--cor-borda)] rounded-2xl w-full max-w-2xl overflow-hidden shadow-2xl flex flex-col max-h-[90vh]"
         onClick={(e) => e.stopPropagation()}
       >
         {/* Header */}
-        <div className="px-6 py-4 border-b border-white/5 flex items-center justify-between bg-[#05070A]/80 font-sans">
+        <div className="px-6 py-4 border-b border-[var(--cor-borda)] flex items-center justify-between bg-[var(--cor-card-fundo)] font-sans">
           <div className="flex items-center gap-2">
-            <div className="bg-blue-600/10 p-1.5 rounded text-blue-500">
+            <div className="bg-[var(--cor-primaria-clara)] p-1.5 rounded text-[var(--cor-primaria)]">
               <Folder className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+              <h3 className="text-sm font-semibold text-[var(--cor-texto)]">
                 Sincronizador Google Drive (RAG)
               </h3>
-              <p className="text-[10px] text-slate-500 font-mono">Real-time Multi-PDD & T2R Indexer</p>
+              <p className="text-xs text-[var(--cor-texto-secundario)]">Indexação de PDDs & Processos</p>
             </div>
           </div>
           <button 
             onClick={onClose}
             disabled={syncing}
-            className="text-slate-400 hover:text-slate-200 transition-colors disabled:opacity-30"
+            className="text-[var(--cor-texto-secundario)] hover:text-[var(--cor-texto)] transition-colors disabled:opacity-30 cursor-pointer"
           >
             <X className="w-4 h-4" />
           </button>
@@ -158,16 +158,16 @@ export default function SyncModal({
         <div className="p-6 overflow-y-auto space-y-4 flex-1 font-sans">
           {!token ? (
             <div className="bg-amber-500/10 border border-amber-500/20 rounded-xl p-5 text-center space-y-3">
-              <ShieldAlert className="w-10 h-10 text-amber-500 mx-auto animate-pulse" />
+              <ShieldAlert className="w-10 h-10 text-amber-500 mx-auto" />
               <div className="space-y-1">
-                <p className="text-xs font-bold text-amber-400 uppercase tracking-wider font-sans">Conexão Necessária</p>
-                <p className="text-xs text-slate-400">
+                <p className="text-xs font-semibold text-amber-500">Conexão Necessária</p>
+                <p className="text-xs text-[var(--cor-texto-secundario)]">
                   Você precisa autorizar a conexão com o Google Drive para poder rastrear e ler as pastas de seus clientes.
                 </p>
               </div>
               <button
                 onClick={onLoginWithGoogle}
-                className="bg-blue-600 hover:bg-blue-500 text-white text-xs font-bold px-4 py-2 rounded-lg transition-colors shadow-[0_0_12px_rgba(37,99,235,0.3)] cursor-pointer"
+                className="bg-[var(--cor-balaousuario-fundo)] hover:opacity-90 text-white text-xs font-medium px-4 py-2 rounded-lg transition-colors shadow-xs cursor-pointer"
               >
                 Conectar ao Google Drive
               </button>
@@ -175,7 +175,7 @@ export default function SyncModal({
           ) : (
             <div className="space-y-4">
               <div className="space-y-2">
-                <label className="block text-xs font-semibold text-slate-400 uppercase tracking-wider">
+                <label className="block text-xs font-semibold text-[var(--cor-texto)]">
                   Link ou ID da Pasta do Drive:
                 </label>
                 <div className="flex gap-2">
@@ -185,12 +185,12 @@ export default function SyncModal({
                     onChange={(e) => setInputFolderLink(e.target.value)}
                     disabled={syncing}
                     placeholder="Cole o link completo da pasta ou o ID (ex: 1A_B-C_D-E...)"
-                    className="flex-1 bg-[#05070A] border border-white/10 rounded-lg px-3 py-2 text-xs text-white placeholder-slate-600 focus:outline-none focus:border-blue-500 transition-all font-mono"
+                    className="flex-1 bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-lg px-3 py-2 text-xs text-[var(--cor-texto)] placeholder-[var(--cor-texto-secundario)] focus:outline-none focus:border-[var(--cor-primaria)] focus:bg-[var(--cor-card-fundo)] transition-all font-mono"
                   />
                   <button
                     onClick={handleStartSync}
                     disabled={syncing || !inputFolderLink.trim()}
-                    className="bg-blue-600 hover:bg-blue-500 text-white font-bold px-4 py-2 rounded-lg text-xs transition-colors disabled:opacity-50 flex items-center gap-1.5 shadow-[0_0_12px_rgba(37,99,235,0.3)] cursor-pointer"
+                    className="bg-[var(--cor-balaousuario-fundo)] hover:opacity-90 text-white font-medium px-4 py-2 rounded-lg text-xs transition-colors disabled:opacity-50 flex items-center gap-1.5 shadow-xs cursor-pointer"
                   >
                     {syncing ? (
                       <>
@@ -205,37 +205,37 @@ export default function SyncModal({
                     )}
                   </button>
                 </div>
-                <p className="text-[10px] text-slate-500 font-sans">
+                <p className="text-xs text-[var(--cor-texto-secundario)]">
                   Dica: O ID é o código no final do endereço da pasta ou cole o endereço completo da barra de navegação.
                 </p>
               </div>
 
               {/* Console de logs */}
               <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-[10px] font-semibold text-slate-400 uppercase tracking-wider font-mono">
+                <div className="flex items-center justify-between text-xs font-semibold text-[var(--cor-texto-secundario)]">
                   <span className="flex items-center gap-1">
-                    <Terminal className="w-3.5 h-3.5 text-blue-500" />
+                    <Terminal className="w-3.5 h-3.5 text-[var(--cor-primaria)]" />
                     Console de Indexação RAG em Tempo Real
                   </span>
                   {syncing && (
-                    <span className="text-amber-500 animate-pulse flex items-center gap-1">
+                    <span className="text-amber-500 animate-pulse flex items-center gap-1 text-xs">
                       <RefreshCw className="w-2.5 h-2.5 animate-spin" />
                       Indexando arquivos...
                     </span>
                   )}
                 </div>
                 
-                <div className="bg-[#020305] border border-white/5 rounded-lg p-3 h-48 overflow-y-auto font-mono text-[11px] leading-relaxed custom-scrollbar text-emerald-400">
+                <div className="bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-lg p-3 h-48 overflow-y-auto font-mono text-xs leading-relaxed custom-scrollbar text-[var(--cor-texto)]">
                   {logs.length === 0 ? (
-                    <div className="text-slate-600 italic">
-                      [SISTEMA] Aguardando link ou ID para iniciar processo de escaneamento de PDDs e T2Rs...
+                    <div className="text-[var(--cor-texto-secundario)] italic">
+                      [SISTEMA] Aguardando link ou ID para iniciar processo de escaneamento de PDDs e processos...
                     </div>
                   ) : (
                     logs.map((log, index) => {
-                      let colorClass = "text-emerald-400";
-                      if (log.startsWith("[ERRO]")) colorClass = "text-rose-400 font-bold";
-                      if (log.startsWith("[SISTEMA]")) colorClass = "text-blue-400 font-semibold";
-                      if (log.includes("->")) colorClass = "text-sky-300";
+                      let colorClass = "text-[var(--cor-texto)]";
+                      if (log.startsWith("[ERRO]")) colorClass = "text-rose-500 font-bold";
+                      if (log.startsWith("[SISTEMA]")) colorClass = "text-[var(--cor-primaria)] font-semibold";
+                      if (log.includes("->")) colorClass = "text-blue-500";
                       return (
                         <div key={index} className={colorClass}>
                           {log}
@@ -249,7 +249,7 @@ export default function SyncModal({
 
               {/* Status Banner */}
               {statusMessage && (
-                <div className="bg-[#05070A] border border-white/10 rounded-lg p-3 flex items-center justify-between text-xs text-slate-300">
+                <div className="bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-lg p-3 flex items-center justify-between text-xs text-[var(--cor-texto)]">
                   <span className="flex items-center gap-1.5">
                     <CheckCircle2 className="w-4 h-4 text-emerald-500 flex-shrink-0" />
                     {statusMessage}
@@ -263,7 +263,7 @@ export default function SyncModal({
                         onClose();
                       }
                     }}
-                    className="text-[10px] text-slate-500 hover:text-slate-300 underline cursor-pointer"
+                    className="text-xs text-[var(--cor-primaria)] hover:underline cursor-pointer"
                   >
                     OK
                   </button>
@@ -274,7 +274,7 @@ export default function SyncModal({
         </div>
 
         {/* Footer */}
-        <div className="px-6 py-3 border-t border-white/5 bg-[#05070A]/50 flex justify-end gap-2 text-[10px] text-slate-500">
+        <div className="px-6 py-3 border-t border-[var(--cor-borda)] bg-[var(--cor-card-fundo)] flex justify-end gap-2 text-xs text-[var(--cor-texto-secundario)]">
           <span>O backend extrairá texto via Gemini de múltiplos formatos (PDFs, Planilhas, Docs)</span>
         </div>
       </div>

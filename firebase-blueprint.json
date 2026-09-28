@@ -1,0 +1,36 @@
+{
+  "entities": {
+    "users": {
+      "fields": {
+        "email": { "type": "string" },
+        "createdAt": { "type": "string" }
+      }
+    },
+    "conversas": {
+      "fields": {
+        "mensagens": { "type": "array" },
+        "mensagensIndexadas": { "type": "number" },
+        "criadoEm": { "type": "timestamp" },
+        "atualizadoEm": { "type": "timestamp" }
+      }
+    },
+    "chunks": {
+      "fields": {
+        "uid": { "type": "string" },
+        "conversaId": { "type": "string" },
+        "role": { "type": "string" },
+        "texto": { "type": "string" },
+        "criadoEm": { "type": "timestamp" }
+      }
+    },
+    "consultas": {
+      "fields": {
+        "titulo": { "type": "string" },
+        "criadoEm": { "type": "timestamp" }
+      }
+    }
+  },
+  "firestore": {
+    "indexes": []
+  }
+}

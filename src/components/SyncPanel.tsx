@@ -239,7 +239,7 @@ export default function SyncPanel({
       {/* Intro e Explicação */}
       <div className="bg-[#080B12] rounded-xl p-5 border border-white/5 space-y-4">
         <div className="flex items-start gap-4">
-          <div className="bg-blue-600 p-2.5 rounded-lg text-white shadow-[0_0_12px_rgba(37,99,235,0.4)]">
+          <div className="bg-[#1B60BC] p-2.5 rounded-lg text-white shadow-xs">
             <HelpCircle className="w-6 h-6" />
           </div>
           <div className="space-y-1">
@@ -311,7 +311,7 @@ export default function SyncPanel({
               <button
                 onClick={onLoginWithGoogle}
                 disabled={syncing}
-                className="w-full bg-blue-600 hover:bg-blue-500 text-white font-medium py-2.5 px-4 rounded-lg text-xs transition-all flex items-center justify-center gap-2 disabled:opacity-50 shadow-[0_0_12px_rgba(37,99,235,0.35)]"
+                className="w-full bg-[#1B60BC] hover:bg-[#154FA0] text-white font-medium py-2.5 px-4 rounded-lg text-xs transition-all flex items-center justify-center gap-2 disabled:opacity-50 shadow-xs cursor-pointer"
               >
                 <FolderPlus className="w-4 h-4" />
                 Conectar Drive
@@ -445,7 +445,7 @@ export default function SyncPanel({
                       type="button"
                       onClick={() => resolveFolderName(selectedFolderId)}
                       disabled={loadingFolderName}
-                      className="bg-blue-600/10 hover:bg-blue-600/20 border border-blue-500/20 hover:border-blue-500/40 text-blue-400 text-xs font-semibold px-3 py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50"
+                      className="bg-[#1B60BC]/10 hover:bg-[#1B60BC]/20 border border-[#1B60BC]/20 text-[#1B60BC] text-xs font-semibold px-3 py-2 rounded-lg transition-colors flex items-center justify-center gap-1.5 disabled:opacity-50 cursor-pointer"
                     >
                       {loadingFolderName ? (
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />

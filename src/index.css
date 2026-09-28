@@ -1,1 +1,78 @@
 @import "tailwindcss";
+
+@custom-variant dark (&:where([data-theme="dark"], [data-theme="dark"] *, .dark, .dark *));
+
+:root {
+  --cor-primaria: #0F2942;
+  --cor-primaria-hover: #163659;
+  --cor-primaria-clara: #EBF2F7;
+  --cor-fundo: #FFFFFF;
+  --cor-card-fundo: #FFFFFF;
+  --cor-superficie: #F6F9FC;
+  --cor-chat-fundo: #EDF4FA;
+  --cor-header-fundo: #0F2942;
+  --cor-header-borda: #0A1E31;
+  --cor-borda: #E2E8F0;
+  --cor-borda-primaria: #C7D8E8;
+  --cor-texto: #0F172A;
+  --cor-texto-secundario: #475569;
+  --cor-aviso-fundo: #FFF7E6;
+  --cor-aviso-texto: #92600D;
+  --cor-balaousuario-fundo: #0F2942;
+  --cor-balaousuario-borda: #0A1E31;
+  --cor-hover: #F1F5F9;
+}
+
+.dark, [data-theme="dark"] {
+  --cor-primaria: #38BDF8;
+  --cor-primaria-hover: #0EA5E9;
+  --cor-primaria-clara: #122842;
+  --cor-fundo: #090E17;
+  --cor-card-fundo: #0F172A;
+  --cor-superficie: #141E33;
+  --cor-chat-fundo: #080D16;
+  --cor-header-fundo: #080E18;
+  --cor-header-borda: #152238;
+  --cor-borda: #1E293B;
+  --cor-borda-primaria: #243B5C;
+  --cor-texto: #F1F5F9;
+  --cor-texto-secundario: #94A3B8;
+  --cor-aviso-fundo: #2D2206;
+  --cor-aviso-texto: #FCD34D;
+  --cor-balaousuario-fundo: #1E3A5F;
+  --cor-balaousuario-borda: #2B4E7E;
+  --cor-hover: #19263E;
+}
+
+body {
+  background-color: var(--cor-fundo);
+  color: var(--cor-texto);
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+}
+
+@keyframes float {
+  0%, 100% {
+    transform: translateY(0px);
+  }
+  50% {
+    transform: translateY(-5px);
+  }
+}
+
+.animate-float {
+  animation: float 2.6s ease-in-out infinite;
+}
+
+/* Destaque aprimorado para o mascote robbi9 na versão branca (clara) e escura */
+.mascote-destaque {
+  filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.22)) drop-shadow(0 4px 14px rgba(14, 165, 233, 0.32)) contrast(1.08) saturate(1.15);
+  transition: filter 0.25s ease, transform 0.25s ease;
+}
+
+.mascote-destaque:hover {
+  transform: scale(1.06);
+}
+
+.dark .mascote-destaque, [data-theme="dark"] .mascote-destaque {
+  filter: drop-shadow(0 4px 14px rgba(56, 189, 248, 0.55)) contrast(1) saturate(1);
+}

@@ -1,215 +1,215 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Layers, Database, RefreshCw, ShieldCheck, User, LogOut, ArrowRight, Sparkles } from "lucide-react";
+import { Database, User, LogOut, Sparkles, Plus, History, ChevronDown, Sun, Moon } from "lucide-react";
 import ChatPanel from "./components/ChatPanel";
 import SourcesPanel from "./components/SourcesPanel";
-import { ClientGroup } from "./types";
+import TelaDeLogin from "./components/TelaDeLogin";
+import { useAuth } from "./hooks/useAuth";
+import { useDbStatus } from "./hooks/useDbStatus";
+import { useTheme } from "./hooks/useTheme";
 
 export default function App() {
-  const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const [loading, setLoading] = useState(false);
+  const { usuario, carregandoAuth, userEmail, authError, logout } = useAuth();
+  const { theme, toggleTheme } = useTheme();
+
+  // Estados de layout e menu
   const [showSources, setShowSources] = useState(true);
-  const [selectedFileIds, setSelectedFileIds] = useState<string[]>([]);
-  const [dbStatus, setDbStatus] = useState({
-    mode: "demo" as "real" | "demo",
-    rootFolderId: "",
-    rootFolderName: "",
-    fileCount: 0,
-    chunkCount: 0,
-    clientGroups: [] as ClientGroup[]
-  });
+  const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
+  const [triggerNewSession, setTriggerNewSession] = useState(0);
+  const [triggerOpenHistory, setTriggerOpenHistory] = useState(0);
+  const headerMenuRef = useRef<HTMLDivElement>(null);
 
-  const [activeSessionId, setActiveSessionId] = useState<string>(() => {
-    return localStorage.getItem("biti9_active_session_id") || "default_session";
-  });
-
-  const userEmail = "gabriel.conceicao@biti9.com.br";
-  const abortControllerRef = useRef<AbortController | null>(null);
-
-  // Filtros selecionados no Sidebar
+  // Filtros de seleção rápida
   const [selectedClientId, setSelectedClientId] = useState("");
   const [selectedRobotId, setSelectedRobotId] = useState("");
 
-  // Carrega status e arquivos do Banco de Vetores para a conversa ativa
-  const loadDbStatus = async (targetSessionId?: string) => {
-    const sessId = targetSessionId || activeSessionId;
+  // Hook centralizado para fontes e banco de vetores
+  const {
+    dbStatus,
+    loading,
+    activeSessionId,
+    selectedFileIds,
+    setSelectedFileIds,
+    loadDbStatus,
+    handleSessionChange,
+    handleToggleFile,
+    handleToggleAll
+  } = useDbStatus(userEmail);
 
-    // Cancela requisição anterior se houver para evitar sobrescrever com dados antigos
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-    }
-
-    const controller = new AbortController();
-    abortControllerRef.current = controller;
-
-    // 1. Reset imediato de estado para feedback visual instantâneo na UI
-    setDbStatus(prev => ({
-      ...prev,
-      clientGroups: [],
-      fileCount: 0,
-      chunkCount: 0
-    }));
-    setSelectedFileIds([]);
-    setLoading(true);
-
-    try {
-      const emailParam = `?email=${encodeURIComponent(userEmail)}`;
-      const res = await fetch(`/api/conversations/${encodeURIComponent(sessId)}/sources${emailParam}`, {
-        signal: controller.signal
-      });
-
-      if (res.ok) {
-        const data = await res.json();
-        // Apenas atualiza se este ainda for o controller ativo mais recente
-        if (abortControllerRef.current === controller) {
-          setDbStatus({
-            mode: data.mode || "demo",
-            rootFolderId: data.rootFolderId || "",
-            rootFolderName: data.rootFolderName || "",
-            fileCount: data.fileCount || 0,
-            chunkCount: data.chunkCount || 0,
-            clientGroups: data.clientGroups || []
-          });
-        }
-      }
-    } catch (e: any) {
-      if (e.name === "AbortError") {
-        // Ignorar requisições abortadas ao alternar rapidamente entre conversas
-        return;
-      }
-      console.error("Erro ao carregar dados do banco de dados", e);
-    } finally {
-      if (abortControllerRef.current === controller) {
-        setLoading(false);
-      }
-    }
-  };
-
+  // Resetar selectedFileIds ao iniciar uma nova conversa
   useEffect(() => {
-    loadDbStatus(activeSessionId);
-    return () => {
-      if (abortControllerRef.current) {
-        abortControllerRef.current.abort();
+    if (triggerNewSession > 0) {
+      setSelectedFileIds([]);
+    }
+  }, [triggerNewSession, setSelectedFileIds]);
+
+  // Fecha o menu suspenso ao clicar fora
+  useEffect(() => {
+    const handleClickOutside = (e: MouseEvent) => {
+      if (headerMenuRef.current && !headerMenuRef.current.contains(e.target as Node)) {
+        setHeaderMenuOpen(false);
       }
     };
-  }, [activeSessionId]);
-
-  const handleSessionChange = (newSessionId: string) => {
-    // Reset imediato antes de qualquer requisição
-    setDbStatus(prev => ({
-      ...prev,
-      clientGroups: [],
-      fileCount: 0,
-      chunkCount: 0
-    }));
-    setSelectedFileIds([]);
-    setActiveSessionId(newSessionId);
-    localStorage.setItem("biti9_active_session_id", newSessionId);
-    loadDbStatus(newSessionId);
-  };
-
-  // Sincroniza selectedFileIds para marcar novas fontes por padrão ao subir ou carregar e limpar deletados
-  useEffect(() => {
-    const allFileIds: string[] = [];
-    dbStatus.clientGroups.forEach(client => {
-      client.robots.forEach(robot => {
-        robot.documents.forEach(doc => {
-          allFileIds.push(doc.id);
-        });
-      });
-    });
-
-    setSelectedFileIds(prev => {
-      // 1. Filtra IDs que não existem mais no sistema (arquivos excluídos)
-      let nextSelection = prev.filter(id => allFileIds.includes(id));
-      let changed = nextSelection.length !== prev.length;
-
-      // 2. Adiciona novos por padrão (novas sincronizações ou uploads)
-      allFileIds.forEach(id => {
-        if (!nextSelection.includes(id)) {
-          nextSelection.push(id);
-          changed = true;
-        }
-      });
-
-      return changed ? nextSelection : prev;
-    });
-  }, [dbStatus.clientGroups]);
-
-  const handleSelectFilter = (clientId: string, robotId: string) => {
-    setSelectedClientId(clientId);
-    setSelectedRobotId(robotId);
-  };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   const handleResetFilters = () => {
     setSelectedClientId("");
     setSelectedRobotId("");
   };
 
-  const handleToggleFile = (fileId: string) => {
-    setSelectedFileIds(prev => {
-      if (prev.includes(fileId)) {
-        return prev.filter(id => id !== fileId);
-      } else {
-        return [...prev, fileId];
-      }
-    });
-  };
+  // 1. Carregando autenticação
+  if (carregandoAuth) {
+    return (
+      <div className="flex flex-col items-center justify-center min-h-screen bg-[var(--cor-fundo)] text-[var(--cor-texto)]">
+        <div className="w-10 h-10 border-2 border-[var(--cor-primaria)] border-t-transparent rounded-full animate-spin mb-4" />
+        <p className="text-xs text-[var(--cor-texto-secundario)] font-medium">Carregando...</p>
+      </div>
+    );
+  }
 
-  const handleToggleAll = (checked: boolean) => {
-    if (checked) {
-      const allFileIds: string[] = [];
-      dbStatus.clientGroups.forEach(client => {
-        client.robots.forEach(robot => {
-          robot.documents.forEach(doc => {
-            allFileIds.push(doc.id);
-          });
-        });
-      });
-      setSelectedFileIds(allFileIds);
-    } else {
-      setSelectedFileIds([]);
-    }
-  };
+  // 2. Não autenticado -> Tela de Login
+  if (!usuario) {
+    return <TelaDeLogin initialError={authError} />;
+  }
 
+  // 3. Aplicação principal autenticada
   return (
-    <div className="flex flex-col h-screen w-screen bg-[#05070A] font-sans overflow-hidden text-slate-300">
+    <div className="flex flex-col h-screen w-screen bg-[var(--cor-fundo)] font-sans overflow-hidden text-[var(--cor-texto)]">
       
-      {/* Top Header Barra de Navegação */}
-      <header className="bg-[#080B12] border-b border-white/5 flex-shrink-0 h-16 flex items-center justify-between px-4 lg:px-6 z-20">
-        <div className="flex items-center gap-3">
-          <div className="bg-blue-600 p-2 rounded-lg text-white shadow-[0_0_15px_rgba(37,99,235,0.45)]">
-            <Layers className="w-5 h-5" />
-          </div>
-          <div>
-            <div className="flex items-center gap-2">
-              <h1 className="text-sm font-bold uppercase tracking-wider text-white">biti9</h1>
-              <span className="text-[10px] font-semibold bg-blue-500/10 text-blue-400 border border-blue-500/20 px-1.5 py-0.5 rounded font-mono">
-                RAG MULTI-PDD
-              </span>
-            </div>
-            <p className="text-[10px] text-blue-400 font-mono uppercase">Neural Indexing Engine Active</p>
+      {/* Top Header Barra de Navegação: Apenas Logo e Menu do Usuário */}
+      <header className="bg-[var(--cor-header-fundo)] border-b border-[var(--cor-header-borda)] flex-shrink-0 h-16 flex items-center justify-between px-4 lg:px-6 z-20 shadow-xs transition-colors duration-200">
+        <div className="flex items-center gap-3.5">
+          <div className="flex items-center py-1">
+            <img
+              src="https://www.biti9.com.br/wp-content/uploads/2024/07/LOGO-BRANCA-1024x619.png"
+              alt="biti9"
+              referrerPolicy="no-referrer"
+              className="h-8 md:h-9 w-auto object-contain select-none"
+            />
           </div>
         </div>
 
-        {/* Corporate Status Badge */}
-        <div className="hidden md:flex items-center gap-2 text-slate-500 font-mono text-[10px] bg-white/[0.02] border border-white/5 px-3 py-1 rounded-full">
-          <Sparkles className="w-3.5 h-3.5 text-blue-400" />
-          <span>PAINEL INTEGRADO CENTRALIZADO</span>
-        </div>
-
-        {/* Toggle para o Painel de Fontes */}
-        <div className="flex items-center gap-3">
+        {/* Controles da Direita: Alternância de Tema e Menu do Usuário */}
+        <div className="flex items-center gap-2 sm:gap-3">
+          {/* Botão de Alternar Versão Clara / Escura */}
           <button
-            onClick={() => setShowSources(prev => !prev)}
-            className={`flex items-center gap-2 text-xs font-semibold px-3 py-1.5 rounded-lg border transition-all cursor-pointer ${
-              showSources 
-                ? "bg-blue-600/10 border-blue-500/30 text-blue-400 hover:bg-blue-600/20" 
-                : "bg-white/5 border-white/10 text-slate-400 hover:bg-white/10"
-            }`}
+            onClick={toggleTheme}
+            className="w-8 h-8 rounded-full bg-white/10 hover:bg-white/15 flex items-center justify-center text-white transition-all cursor-pointer shadow-xs"
+            title={theme === "dark" ? "Alternar para Versão Clara" : "Alternar para Versão Escura"}
+            aria-label="Alternar tema"
           >
-            <Database className="w-3.5 h-3.5" />
-            <span>{showSources ? "Ocultar Fontes" : "Mostrar Fontes"}</span>
+            {theme === "dark" ? (
+              <Sun className="w-4 h-4 text-white" />
+            ) : (
+              <Moon className="w-4 h-4 text-white" />
+            )}
           </button>
+
+          {/* Menu Unificado do Usuário */}
+          <div className="relative" ref={headerMenuRef}>
+            <button
+              onClick={() => setHeaderMenuOpen(prev => !prev)}
+              className="flex items-center gap-2.5 py-1.5 px-3 rounded-full bg-white/10 hover:bg-white/15 text-white transition-all cursor-pointer shadow-xs"
+              title="Menu do Usuário"
+            >
+              <div className="w-7 h-7 rounded-full bg-white/20 flex items-center justify-center text-white font-semibold text-xs flex-shrink-0">
+                {usuario.email ? usuario.email.charAt(0).toUpperCase() : <User className="w-3.5 h-3.5" />}
+              </div>
+              <span className="text-xs font-medium text-white max-w-[170px] sm:max-w-[220px] truncate" title={usuario.email || ""}>
+                {usuario.email}
+              </span>
+              <ChevronDown className={`w-3.5 h-3.5 text-white/70 transition-transform ${headerMenuOpen ? "rotate-180" : ""}`} />
+            </button>
+
+            {headerMenuOpen && (
+              <div className="absolute right-0 top-full mt-2 w-64 bg-[var(--cor-card-fundo)] border border-[var(--cor-borda)] rounded-2xl shadow-xl py-2 z-50 animate-fade-in text-[var(--cor-texto)]">
+                {/* Informações do Usuário e Badge do Painel Consolidado */}
+                <div className="px-4 py-2.5 border-b border-[var(--cor-borda)] space-y-1.5">
+                  <p className="text-xs font-semibold text-[var(--cor-texto)] truncate" title={usuario.email || ""}>
+                    {usuario.email}
+                  </p>
+                  <div className="inline-flex items-center gap-1.5 text-[11px] font-medium text-[var(--cor-primaria)] bg-[var(--cor-primaria-clara)] px-2.5 py-0.5 rounded-full">
+                    <Sparkles className="w-3 h-3 text-[var(--cor-primaria)]" />
+                    <span>Painel Integrado Centralizado</span>
+                  </div>
+                </div>
+
+                {/* Ações Rápidas */}
+                <div className="py-1">
+                  <button
+                    onClick={() => {
+                      setSelectedFileIds([]);
+                      setTriggerNewSession(c => c + 1);
+                      setHeaderMenuOpen(false);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-4 py-2 text-xs text-[var(--cor-texto)] hover:bg-[var(--cor-superficie)] transition-colors cursor-pointer text-left"
+                  >
+                    <Plus className="w-3.5 h-3.5 text-[var(--cor-primaria)]" />
+                    <span>Nova conversa</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setTriggerOpenHistory(c => c + 1);
+                      setHeaderMenuOpen(false);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-4 py-2 text-xs text-[var(--cor-texto)] hover:bg-[var(--cor-superficie)] transition-colors cursor-pointer text-left"
+                  >
+                    <History className="w-3.5 h-3.5 text-amber-500" />
+                    <span>Histórico de conversas</span>
+                  </button>
+
+                  <button
+                    onClick={() => {
+                      setShowSources(prev => !prev);
+                      setHeaderMenuOpen(false);
+                    }}
+                    className="w-full flex items-center gap-2.5 px-4 py-2 text-xs text-[var(--cor-texto)] hover:bg-[var(--cor-superficie)] transition-colors cursor-pointer text-left"
+                  >
+                    <Database className="w-3.5 h-3.5 text-[var(--cor-primaria)]" />
+                    <span>{showSources ? "Ocultar fontes" : "Mostrar fontes"}</span>
+                  </button>
+
+                  {/* Alternar Tema no Menu */}
+                  <button
+                    onClick={() => {
+                      toggleTheme();
+                    }}
+                    className="w-full flex items-center justify-between px-4 py-2 text-xs text-[var(--cor-texto)] hover:bg-[var(--cor-superficie)] transition-colors cursor-pointer text-left"
+                  >
+                    <div className="flex items-center gap-2.5">
+                      {theme === "dark" ? (
+                        <Sun className="w-3.5 h-3.5 text-amber-400" />
+                      ) : (
+                        <Moon className="w-3.5 h-3.5 text-sky-600" />
+                      )}
+                      <span>{theme === "dark" ? "Versão Clara" : "Versão Escura"}</span>
+                    </div>
+                    <span className="text-[10px] text-[var(--cor-primaria)] font-semibold px-2 py-0.5 rounded-full bg-[var(--cor-primaria-clara)]">
+                      {theme === "dark" ? "Escuro" : "Claro"}
+                    </span>
+                  </button>
+                </div>
+
+                <div className="my-1 border-t border-[var(--cor-borda)]" />
+
+                {/* Botão Sair */}
+                <div className="pt-1">
+                  <button
+                    onClick={() => {
+                      setHeaderMenuOpen(false);
+                      logout();
+                    }}
+                    className="w-full flex items-center gap-2.5 px-4 py-2 text-xs text-rose-600 hover:bg-rose-500/10 transition-colors cursor-pointer text-left font-medium"
+                  >
+                    <LogOut className="w-3.5 h-3.5" />
+                    <span>Sair da conta</span>
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
       </header>
@@ -231,7 +231,7 @@ export default function App() {
         )}
 
         {/* Centro/Direita: Chat de Conversa */}
-        <main className="flex-1 flex flex-col min-h-0 bg-[#05070A]">
+        <main className="flex-1 flex flex-col min-h-0 bg-[var(--cor-fundo)]">
           <ChatPanel
             selectedClientId={selectedClientId}
             selectedRobotId={selectedRobotId}
@@ -243,6 +243,12 @@ export default function App() {
             selectedFileIds={selectedFileIds}
             activeSessionId={activeSessionId}
             onSessionChange={handleSessionChange}
+            onNewSession={() => setSelectedFileIds([])}
+            showSources={showSources}
+            onToggleSources={() => setShowSources(prev => !prev)}
+            triggerNewSession={triggerNewSession}
+            triggerOpenHistory={triggerOpenHistory}
+            userId={usuario?.uid}
           />
         </main>
       </div>

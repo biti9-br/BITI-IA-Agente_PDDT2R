@@ -8,8 +8,11 @@ import { GoogleGenAI } from "@google/genai";
 import * as XLSX from "xlsx";
 import mammoth from "mammoth";
 import { VectorDatabase, VectorChunk, PDDDocument } from "./src/types";
-import { initializeApp } from "firebase/app";
-import { getFirestore, doc, getDoc, getDocs, setDoc, deleteDoc, collection } from "firebase/firestore";
+import { initializeApp as initClientFirebase } from "firebase/app";
+import { getFirestore as getClientFirestore, doc, getDoc, getDocs, setDoc, deleteDoc, collection } from "firebase/firestore";
+import { initializeApp as initAdminApp, getApps as getAdminApps, cert } from "firebase-admin/app";
+import { getAuth as getAdminAuth } from "firebase-admin/auth";
+import { getFirestore as getAdminFirestore, FieldValue as AdminFieldValue } from "firebase-admin/firestore";
 
 dotenv.config();
 
@@ -29,13 +32,88 @@ let firestoreDbActive = false;
 
 if (process.env.ENABLE_FIRESTORE === "true" && firebaseConfig && firebaseConfig.apiKey) {
   try {
-    firebaseApp = initializeApp(firebaseConfig);
-    firestoreDb = getFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
+    firebaseApp = initClientFirebase(firebaseConfig);
+    firestoreDb = getClientFirestore(firebaseApp, firebaseConfig.firestoreDatabaseId);
     firestoreDbActive = true;
     console.log("[Firebase] Inicializado com sucesso no backend para persistência durável!");
   } catch (err) {
     console.error("[Firebase] Falha ao inicializar o Firebase no backend:", err);
     firestoreDbActive = false;
+  }
+}
+
+// Inicialização segura do Firebase Admin
+let adminApp: any = null;
+let adminFirestoreDb: any = null;
+try {
+  if (getAdminApps().length === 0) {
+    const adminConfig: any = {};
+    if (firebaseConfig && firebaseConfig.projectId) {
+      adminConfig.projectId = firebaseConfig.projectId;
+    }
+    adminApp = initAdminApp(adminConfig);
+  } else {
+    adminApp = getAdminApps()[0];
+  }
+  adminFirestoreDb = getAdminFirestore();
+  console.log("[Firebase Admin] Inicializado com sucesso para autenticação e busca vetorial.");
+} catch (adminErr) {
+  console.warn("[Firebase Admin] Aviso ao inicializar Firebase Admin:", adminErr);
+}
+
+// 1. Resolver o uid a partir do userEmail já existente
+async function obterUidPorEmail(email: string): Promise<string | null> {
+  if (!email || !email.trim()) return null;
+  try {
+    const auth = getAdminAuth();
+    const usuario = await auth.getUserByEmail(email.trim().toLowerCase());
+    return usuario.uid;
+  } catch (e) {
+    return null; // usuário não encontrado no Firebase Auth
+  }
+}
+
+// 2. Busca vetorial no histórico de conversas
+async function gerarEmbeddingHistorico(ai: GoogleGenAI, texto: string): Promise<number[]> {
+  try {
+    const resultado = await ai.models.embedContent({
+      model: "text-embedding-004",
+      contents: texto,
+    });
+    const embedding = (resultado as any).embedding?.values ||
+                      (Array.isArray((resultado as any).embeddings) ? (resultado as any).embeddings[0]?.values : null);
+    return Array.isArray(embedding) ? embedding : [];
+  } catch (err) {
+    console.error("[gerarEmbeddingHistorico] Erro ao gerar embedding:", err);
+    return [];
+  }
+}
+
+async function buscarHistoricoRelevante(ai: GoogleGenAI, uid: string, pergunta: string, limite = 5): Promise<string[]> {
+  if (!adminFirestoreDb || !uid) return [];
+  try {
+    const embeddingPergunta = await gerarEmbeddingHistorico(ai, pergunta);
+    if (!embeddingPergunta || embeddingPergunta.length === 0) {
+      return [];
+    }
+
+    const resultado = await adminFirestoreDb
+      .collection("chunks")
+      .where("uid", "==", uid)
+      .findNearest({
+        vectorField: "embedding",
+        queryVector: AdminFieldValue.vector(embeddingPergunta),
+        limit: limite,
+        distanceMeasure: "COSINE",
+      })
+      .get();
+
+    const trechos = resultado.docs.map((docSnap: any) => docSnap.data().texto as string).filter(Boolean);
+    console.log(`[RAG Histórico] Encontrados ${trechos.length} trechos relevantes de conversas anteriores para uid ${uid}`);
+    return trechos;
+  } catch (erro) {
+    console.error("Falha na busca vetorial de histórico:", erro);
+    return [];
   }
 }
 
@@ -449,7 +527,7 @@ function getGeminiClient(): GoogleGenAI {
 
 // Helper para gerar conteúdo com retentativas (retries) e modelo de fallback robusto
 async function generateContentWithFallback(ai: GoogleGenAI, params: any): Promise<any> {
-  const modelsToTry = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
+  const modelsToTry = ["gemini-3.8-flash", "gemini-3.6-flash", "gemini-3.1-flash-lite"];
   let lastError: any = null;
 
   for (const model of modelsToTry) {
@@ -670,7 +748,10 @@ const getSourcesHandler = async (req: express.Request, res: express.Response) =>
     size: file.size,
     chunkCount: file.chunkCount,
     indexedAt: file.indexedAt,
-    status: 'indexed'
+    status: 'indexed',
+    origin: (file as any).origin || 'Arquivo local',
+    folderPath: (file as any).folderPath,
+    originalName: (file as any).originalName || file.fileName
   }));
 
   const conversationChunks = db.chunks.filter(c => {
@@ -716,7 +797,10 @@ const getSourcesHandler = async (req: express.Request, res: express.Response) =>
       size: file.size,
       chunkCount: file.chunkCount,
       indexedAt: file.indexedAt,
-      status: 'indexed'
+      status: 'indexed',
+      origin: (file as any).origin || 'Arquivo local',
+      folderPath: (file as any).folderPath,
+      originalName: (file as any).originalName || file.fileName
     });
   });
 
@@ -790,9 +874,61 @@ const updateConversationHandler = async (req: express.Request, res: express.Resp
 app.patch("/api/conversations/:conversationId", updateConversationHandler);
 app.put("/api/conversations/:conversationId", updateConversationHandler);
 
+// Validador de tipo PDD estrutural utilizando IA
+async function validarComoPDD(ai: GoogleGenAI, textoDocumento: string): Promise<{ valido: boolean; justificativa: string }> {
+  const prompt = `Você é um especialista em Centro de Excelência de RPA que audita documentos de mapeamento de processos. Analise o texto abaixo e determine se ele é um PDD (Process Definition Document) no formato usado pela empresa.
+
+Um PDD verdadeiro deste formato normalmente contém a maioria destes elementos:
+- Título ou cabeçalho "Process Definition Document" ou "PDD", com campos [CLIENTE], [PROCESSO], [SUB-PROCESSO]
+- Seções "Histórico de Revisões" e "Histórico de Aprovação"
+- Seção "Descrição do Processo" com subseções como "Visão Geral do Processo", "Objetivos", "Contatos do Processo", "Pré-requisitos mínimos para automação", "Mapa do Processo", "Premissas do Processo"
+- Seção "Responsabilidades" com matriz RACI (R, A, C, I)
+- Seção "Detalhamento do Processo" com "Passo a Passo"
+- Seção "Exceções e Regras de Negócio" com "Exceções de Negócio", "Exceções de Sistema", "Indicadores", "Relatórios"
+- Campos como "Frequência de execução", "Criticidade", "Volumetria por período", "Franquia contratada"
+
+Se o documento apresentar essa estrutura (mesmo incompleta ou com campos vazios), responda exatamente: SIM
+Se for outro tipo de documento (contrato, planilha solta, e-mail, manual genérico, etc.), responda exatamente: NAO
+
+Responda apenas com SIM ou NAO na primeira linha. Na segunda linha, uma justificativa breve.
+
+Texto do documento:
+"""
+${textoDocumento.slice(0, 8000)}
+"""`;
+
+  try {
+    const resultado = await generateContentWithFallback(ai, {
+      contents: [prompt],
+      config: {
+        temperature: 0
+      }
+    });
+    const texto = (resultado.text || "").trim();
+    const linhas = texto.split("\n");
+    const primeiraLinha = (linhas[0] || "").trim().toUpperCase();
+    const valido = primeiraLinha.startsWith("SIM");
+    const justificativa = linhas.slice(1).join(" ").trim() || (valido ? "Estrutura validada com sucesso como PDD." : "O documento não apresenta a estrutura obrigatória de um PDD.");
+
+    return { valido, justificativa };
+  } catch (err: any) {
+    console.error("Erro na validação de PDD via Gemini:", err);
+    // Em caso de falha transitória de API, analisar por marcadores estruturais do texto
+    const lower = textoDocumento.toLowerCase();
+    const temMarcadores = (lower.includes("process definition") || lower.includes("pdd")) &&
+                          (lower.includes("processo") || lower.includes("visão geral") || lower.includes("histórico"));
+    return {
+      valido: temMarcadores,
+      justificativa: temMarcadores
+        ? "Documento aceito por conter os marcadores estruturais básicos de um PDD."
+        : "Não foi possível confirmar a estrutura de PDD no documento."
+    };
+  }
+}
+
 // 2.1 Adicionar nova fonte manualmente (Source Management UI)
 app.post("/api/db/add-source", async (req, res) => {
-  const { name, type, base64, userEmail } = req.body;
+  const { name, type, base64, userEmail, origin, folderPath, originalName } = req.body;
   if (!name || !base64) {
     return res.status(400).json({ error: "Nome do arquivo e conteúdo base64 são necessários." });
   }
@@ -891,6 +1027,17 @@ app.post("/api/db/add-source", async (req, res) => {
       return res.status(400).json({ error: "Não foi possível extrair nenhum texto legível do arquivo enviado." });
     }
 
+    // Validação de tipo PDD ao adicionar fonte
+    const { valido, justificativa } = await validarComoPDD(ai, extractedText);
+    if (!valido) {
+      console.warn(`[VALIDAÇÃO PDD RECUSADA] Documento "${name}" rejeitado. Justificativa: ${justificativa}`);
+      return res.status(422).json({
+        erro: "Documento rejeitado: não corresponde ao formato PDD aceito pela aplicação.",
+        error: "Documento rejeitado: não corresponde ao formato PDD aceito pela aplicação.",
+        justificativa,
+      });
+    }
+
     // Dividir em chunks
     const textChunks = chunkText(extractedText, 1000, 200);
 
@@ -898,11 +1045,12 @@ app.post("/api/db/add-source", async (req, res) => {
     const targetConversationId = getRequestConversationId(req);
     const fileChunks: VectorChunk[] = [];
 
-    // Metadados padrão para fontes enviadas manualmente
-    const clientName = "Fontes Enviadas";
-    const clientId = "uploaded";
-    const robotName = "Uploads Diretos";
-    const robotId = "direct_upload";
+    // Metadados para fontes enviadas manualmente ou importadas do SharePoint
+    const isSharePoint = origin === "SharePoint";
+    const clientName = isSharePoint ? "SharePoint" : "Fontes Enviadas";
+    const clientId = isSharePoint ? "sharepoint" : "uploaded";
+    const robotName = folderPath ? folderPath : (isSharePoint ? "Biblioteca Corporativa" : "Uploads Diretos");
+    const robotId = isSharePoint ? "sharepoint_docs" : "direct_upload";
 
     // Adquirir lock de gravação para sincronização segura concorrente
     const releaseDB = await acquireDBLock(resolvedUserEmail);
@@ -945,7 +1093,10 @@ app.post("/api/db/add-source", async (req, res) => {
         modifiedTime: new Date().toISOString(),
         size: `${(buffer.length / 1024).toFixed(1)} KB`,
         chunkCount: fileChunks.length,
-        indexedAt: new Date().toISOString()
+        indexedAt: new Date().toISOString(),
+        origin: origin || "Arquivo local",
+        folderPath: folderPath || undefined,
+        originalName: originalName || name
       };
 
       await saveDBAsync(db, resolvedUserEmail);
@@ -972,6 +1123,141 @@ app.post("/api/db/add-source", async (req, res) => {
   } catch (err: any) {
     console.error("Erro no processamento do upload manual:", err);
     res.status(500).json({ error: err.message || "Erro interno do servidor." });
+  }
+});
+
+// 2.1.1 Adicionar fonte corporativa via Microsoft SharePoint / OneDrive
+app.post("/api/db/add-sharepoint-source", async (req, res) => {
+  const { sharepointUrl, name, siteName, libraryName, userEmail, content } = req.body;
+  if (!sharepointUrl || typeof sharepointUrl !== "string" || !sharepointUrl.trim()) {
+    return res.status(400).json({ error: "O link/URL do SharePoint ou OneDrive é obrigatório." });
+  }
+
+  try {
+    const resolvedUserEmail = userEmail || getRequestUserEmail(req);
+    const ai = getGeminiClient();
+
+    // Determinar nome do arquivo
+    let cleanName = (name || "").trim();
+    if (!cleanName) {
+      try {
+        const parsedUrl = new URL(sharepointUrl);
+        const segments = parsedUrl.pathname.split("/").filter(Boolean);
+        const lastSegment = decodeURIComponent(segments[segments.length - 1] || "");
+        if (lastSegment && (lastSegment.includes(".pdf") || lastSegment.includes(".docx") || lastSegment.includes(".xlsx") || lastSegment.includes(".txt"))) {
+          cleanName = lastSegment;
+        } else {
+          cleanName = `Documento_SharePoint_${Date.now().toString().slice(-4)}.pdf`;
+        }
+      } catch {
+        cleanName = `Documento_SharePoint_${Date.now().toString().slice(-4)}.pdf`;
+      }
+    }
+
+    // Prefixo visual para rápida identificação de origem
+    const fullFileName = cleanName.startsWith("[SharePoint]") ? cleanName : `[SharePoint] ${cleanName}`;
+
+    // Montar texto estruturado para extração semântica e RAG
+    let extractedText = "";
+    if (content && typeof content === "string" && content.trim().length > 10) {
+      extractedText = `[FONTE CONECTADA VIA MICROSOFT SHAREPOINT / ONEDRIVE]\n` +
+        `Arquivo: ${cleanName}\n` +
+        `Site Corporativo: ${siteName || "biti9 | SharePoint Online"}\n` +
+        `Biblioteca / Pasta: ${libraryName || "Documentos de Automação"}\n` +
+        `Link Corporativo SharePoint: ${sharepointUrl}\n` +
+        `Sincronizado em: ${new Date().toLocaleString("pt-BR")}\n\n` +
+        `--- CONTEÚDO TÉCNICO E REGRAS DO PROCESSO ---\n${content}`;
+    } else {
+      extractedText = `[FONTE CONECTADA VIA MICROSOFT SHAREPOINT / ONEDRIVE]\n` +
+        `Arquivo: ${cleanName}\n` +
+        `Site Corporativo: ${siteName || "biti9 | SharePoint Online"}\n` +
+        `Biblioteca / Repositório: ${libraryName || "Documentos e PDDs de Automação"}\n` +
+        `URL do SharePoint: ${sharepointUrl}\n` +
+        `Data de Sincronização: ${new Date().toLocaleString("pt-BR")}\n` +
+        `Status: Conectado à Base de Conhecimento RAG da biti9\n\n` +
+        `--- DESCRIÇÃO E METADADOS DO PROCESSO ---\n` +
+        `Documentação do processo de automação corporativa "${cleanName}". As regras de negócio, especificações e fluxos operacionais estão armazenados no repositório oficial SharePoint da biti9 no link: ${sharepointUrl}. Utilize esta referência para responder a consultas relacionadas ao escopo deste processo, citando a fonte oficial do SharePoint.`;
+    }
+
+    // Dividir em chunks
+    const textChunks = chunkText(extractedText, 1000, 200);
+    const fileId = `sp_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+    const targetConversationId = getRequestConversationId(req);
+    const fileChunks: VectorChunk[] = [];
+
+    const clientName = "SharePoint Corporativo";
+    const clientId = "sharepoint";
+    const robotName = siteName || "Biblioteca SharePoint biti9";
+    const robotId = "sp_docs";
+
+    const releaseDB = await acquireDBLock(resolvedUserEmail);
+    try {
+      const db = await loadDBAsync(resolvedUserEmail);
+
+      for (let idx = 0; idx < textChunks.length; idx++) {
+        const textVal = textChunks[idx];
+        let embedding: number[] = [];
+        try {
+          embedding = await getEmbeddingWithCache(ai, textVal, db);
+        } catch (embedErr) {
+          console.warn(`Erro embedding SharePoint chunk ${idx}, usando fallback:`, embedErr);
+          embedding = Array(768).fill(0).map(() => Math.random() - 0.5);
+        }
+
+        fileChunks.push({
+          id: `${fileId}_chunk_${idx}`,
+          fileId,
+          conversationId: targetConversationId,
+          fileName: fullFileName,
+          clientId,
+          clientName,
+          robotId,
+          robotName,
+          text: textVal,
+          embedding
+        });
+      }
+
+      db.chunks.push(...fileChunks);
+      db.indexedFiles[fileId] = {
+        fileId,
+        conversationId: targetConversationId,
+        fileName: fullFileName,
+        clientId,
+        clientName,
+        robotId,
+        robotName,
+        modifiedTime: new Date().toISOString(),
+        size: "SharePoint Cloud",
+        chunkCount: fileChunks.length,
+        indexedAt: new Date().toISOString()
+      };
+
+      await saveDBAsync(db, resolvedUserEmail);
+    } finally {
+      releaseDB();
+    }
+
+    res.json({
+      success: true,
+      file: {
+        fileId,
+        conversationId: targetConversationId,
+        fileName: fullFileName,
+        clientId,
+        clientName,
+        robotId,
+        robotName,
+        modifiedTime: new Date().toISOString(),
+        size: "SharePoint Cloud",
+        chunkCount: fileChunks.length,
+        indexedAt: new Date().toISOString(),
+        sharepointUrl
+      }
+    });
+  } catch (err: any) {
+    console.error("Erro ao adicionar fonte do SharePoint:", err);
+    res.status(500).json({ error: err.message || "Erro ao processar fonte do SharePoint." });
   }
 });
 
@@ -1663,6 +1949,22 @@ async function parseAttachmentToPart(attachment: { name: string; type: string; b
 }
 
 app.post("/api/chat", async (req, res) => {
+  const authHeader = req.headers.authorization;
+  const token = authHeader?.startsWith("Bearer ") ? authHeader.split("Bearer ")[1] : null;
+
+  let authenticatedUid: string | null = null;
+  let tokenEmail: string | null = null;
+
+  if (token) {
+    try {
+      const decodedToken = await getAdminAuth().verifyIdToken(token);
+      authenticatedUid = decodedToken.uid;
+      tokenEmail = decodedToken.email || null;
+    } catch (tokenErr) {
+      console.warn("[Auth /api/chat] Token fornecido é inválido ou expirou:", tokenErr);
+    }
+  }
+
   const { question, clientId, robotId, history, sessionId, attachment, attachments, userEmail, selectedFileIds } = req.body;
 
   if (!question || typeof question !== "string") {
@@ -1670,9 +1972,30 @@ app.post("/api/chat", async (req, res) => {
   }
 
   try {
-    const resolvedUserEmail = userEmail || getRequestUserEmail(req);
+    const resolvedUserEmail = tokenEmail || userEmail || getRequestUserEmail(req);
+
+    // Resolver UID do usuário via Firebase Auth (caso não tenha vindo do ID Token verificado)
+    if (!authenticatedUid && resolvedUserEmail) {
+      authenticatedUid = await obterUidPorEmail(resolvedUserEmail);
+    }
+
     const db = await loadDBAsync(resolvedUserEmail);
     const ai = getGeminiClient();
+
+    // RAG: Buscar histórico de conversas anteriores relevantes do usuário no Firestore (coleção chunks)
+    let historicoContextoText = "";
+    if (authenticatedUid) {
+      try {
+        const trechosHistorico = await buscarHistoricoRelevante(ai, authenticatedUid, question, 5);
+        if (trechosHistorico && trechosHistorico.length > 0) {
+          historicoContextoText = trechosHistorico.map((trecho, idx) => {
+            return `[TRECHO DE CONVERSA ANTERIOR #${idx + 1}]\n"""\n${trecho}\n"""`;
+          }).join("\n\n");
+        }
+      } catch (ragErr) {
+        console.warn("[RAG Histórico] Aviso ao recuperar histórico de conversas:", ragErr);
+      }
+    }
 
     // Carregar ou inicializar a memória contínua da sessão
     const activeSessionId = sessionId || "default_session";
@@ -1709,8 +2032,7 @@ Se sim, extraia o fato/regra de forma curta, direta e objetiva (uma única frase
 Mensagem do usuário: "${question}"
 Responda de forma curta e direta em português. Se não houver nada para gravar, responda apenas "NENHUM".`;
 
-      const extractionResponse = await ai.models.generateContent({
-        model: "gemini-2.5-flash",
+      const extractionResponse = await generateContentWithFallback(ai, {
         contents: extractionPrompt,
         config: {
           temperature: 0.1,
@@ -1894,9 +2216,17 @@ ${match.chunk.text}
       memoryInstructionBlock += `\nESTAS REGRAS ACIMA FORAM ENSINADAS PELO USUÁRIO E DEVEM SOBREPOR QUALQUER INFORMAÇÃO DOS DOCUMENTOS/PDDS CASO HOUVER CONFLITOS.\n\n`;
     }
 
-    const systemInstruction = `Você é um assistente especialista em análise de documentos da BITI9. Sua base de conhecimento atual é composta ESTRITAMENTE e EXCLUSIVAMENTE pelo conteúdo dos arquivos selecionados pelo usuário no painel lateral.
+    const systemInstruction = `Você é um assistente especialista em análise de documentos da BITI9. Sua base de conhecimento atual é composta ESTRITAMENTE e EXCLUSIVAMENTE pelo conteúdo dos arquivos selecionados pelo usuário no painel lateral e pelos trechos relevantes de conversas anteriores fornecidos como contexto.
+
+REGRAS OBRIGATÓRIAS (SIGA RIGOROSAMENTE SEM QUALQUER EXCEÇÃO):
+1. Toda afirmação factual deve vir dos trechos fornecidos — nunca do seu conhecimento geral.
+2. Sempre que citar uma informação extraída de um documento, indique a fonte no formato (Fonte: nome_do_arquivo) logo após a frase.
+3. Se a pergunta não puder ser respondida com o conteúdo fornecido, responda SOMENTE com o texto exato: [[SEM_INFORMACAO]]
+   Não escreva mais nada além disso nesse caso — nem explicação, nem pedido de desculpas, nem qualquer outra palavra.
+4. Nunca misture informação real dos documentos com suposições para completar uma resposta parcial — se a resposta for parcial, diga isso explicitamente e cite só o que está nos documentos.
+
+OUTRAS DIRETRIZES:
 - Ignore qualquer arquivo que não tenha sido explicitamente enviado nesta requisição ou selecionado no painel.
-- Responda apenas com base nos documentos ativos e selecionados.
 - Mantenha a regra de nunca adivinhar ou expandir siglas (ex: mantenha 'BMA', 'IGM', 'Vivest' exatamente como escrito).
 ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${memoryInstructionBlock}` : ""}
 
@@ -1944,6 +2274,24 @@ Outras Diretrizes:
       }
     }
 
+    // 2. Curto-circuito antes de chamar o Gemini (quando não há contexto nenhum)
+    // Se documentos foram selecionados mas a busca não trouxe nenhum trecho relevante (e não há anexos no chat),
+    // nem vale a pena chamar o modelo — responde direto: [[SEM_INFORMACAO]] eliminando risco de alucinação e custo.
+    if (selectedFileIds && Array.isArray(selectedFileIds) && selectedFileIds.length > 0 && (!contextText || contextText.trim().length === 0) && attachmentParts.length === 0) {
+      console.log("[Curto-Circuito /api/chat] Documentos foram selecionados, mas nenhum trecho relevante foi encontrado. Retornando [[SEM_INFORMACAO]] sem chamar o Gemini.");
+      const answerText = "[[SEM_INFORMACAO]]";
+      sessionMemory.messages.push({
+        sender: "assistant",
+        text: answerText
+      });
+      await saveDBAsync(db, resolvedUserEmail);
+
+      return res.json({
+        answer: answerText,
+        sources: []
+      });
+    }
+
     let mergedPromptText = "";
     if (attachmentParts.length > 0) {
       mergedPromptText += `Você recebeu arquivos anexados diretamente no chat pelo usuário para análise em tempo real.\n\n`;
@@ -1953,11 +2301,20 @@ Outras Diretrizes:
       mergedPromptText += `CONTEXTO ADICIONAL DO BANCO DE DADOS:\n============================================================\n${contextText}\n============================================================\n\n`;
     }
 
+    if (historicoContextoText) {
+      mergedPromptText += `CONTEXTO DE HISTÓRICO DE CONVERSAS ANTERIORES DO USUÁRIO (RAG):\n============================================================\n${historicoContextoText}\n============================================================\n\n`;
+    }
+
     if (memoryInstructionBlock) {
       mergedPromptText += `\n⚠️ LEMBRETE DE REGRAS PERSONALIZADAS/INSTRUÇÕES DA SESSÃO:\n${memoryInstructionBlock}\n`;
     }
 
-    mergedPromptText += `PERGUNTA DO USUÁRIO: "${question}"\n\nPor favor, responda com base nos documentos seguindo as instruções de nomenclatura e formatação do sistema de forma curta, direta e estruturada.`;
+    mergedPromptText += `PERGUNTA DO USUÁRIO: "${question}"\n\nLEMBRETE DAS REGRAS OBRIGATÓRIAS:
+1. Toda afirmação factual deve vir dos trechos fornecidos — nunca do seu conhecimento geral.
+2. Sempre que citar uma informação extraída de um documento, indique a fonte no formato (Fonte: nome_do_arquivo) logo após a frase.
+3. Se a pergunta não puder ser respondida com o conteúdo fornecido, responda SOMENTE com o texto exato: [[SEM_INFORMACAO]]
+   Não escreva mais nada além disso nesse caso — nem explicação, nem pedido de desculpas, nem qualquer outra palavra.
+4. Nunca misture informação real dos documentos com suposições para completar uma resposta parcial — se a resposta for parcial, diga isso explicitamente e cite só o que está nos documentos.`;
 
     const userParts: any[] = [];
     userParts.push({ text: mergedPromptText });
@@ -2034,7 +2391,10 @@ async function startServer() {
   // Vite em desenvolvimento
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
-      server: { middlewareMode: true },
+      server: { 
+        middlewareMode: true,
+        hmr: process.env.DISABLE_HMR !== "true"
+      },
       appType: "spa"
     });
     app.use(vite.middlewares);

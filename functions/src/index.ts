@@ -1,0 +1,1 @@
+export { indexarMensagensNovas } from "./indexarConversas";

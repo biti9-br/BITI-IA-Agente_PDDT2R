@@ -7,6 +7,16 @@
     <meta name="description" content="Chat corporativo RAG para análise em tempo real de documentos PDD, T2R e planilhas com regras estritas de nomenclatura e tradução para executivos." />
     <meta property="og:title" content="biti9 Central RAG - Consulta de PDDs" />
     <meta property="og:description" content="Chat corporativo RAG para análise em tempo real de documentos PDD, T2R e planilhas com regras estritas de nomenclatura e tradução para executivos." />
+    <script>
+      // Suprime avisos benignos de desconexão de WebSocket do Vite causados pelo HMR desativado no ambiente
+      window.addEventListener('unhandledrejection', function(event) {
+        var reason = event.reason;
+        var msg = reason && (reason.message || String(reason)) || '';
+        if (msg.includes('WebSocket closed without opened') || msg.includes('failed to connect to websocket')) {
+          event.preventDefault();
+        }
+      });
+    </script>
   </head>
   <body>
     <div id="root"></div>

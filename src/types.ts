@@ -12,6 +12,9 @@ export interface PDDDocument {
   indexedAt?: string;
   status: 'pending' | 'indexing' | 'indexed' | 'failed';
   error?: string;
+  origin?: 'SharePoint' | 'Arquivo local' | string;
+  folderPath?: string;
+  originalName?: string;
 }
 
 export interface ClientGroup {
@@ -72,6 +75,15 @@ export interface ChatMessage {
   }>;
 }
 
+export interface ChatSession {
+  id: string;
+  title: string;
+  messages: ChatMessage[];
+  timestamp: string;
+  criadoEm?: any;
+  atualizadoEm?: any;
+}
+
 export interface SessionMemory {
   sessionId: string;
   title?: string;
@@ -96,6 +108,9 @@ export interface VectorDatabase {
     size: string;
     chunkCount: number;
     indexedAt: string;
+    origin?: string;
+    folderPath?: string;
+    originalName?: string;
   }>;
   chunks: VectorChunk[];
   rootFolderId: string;

@@ -13,9 +13,17 @@ import {
   Layers,
   CheckCircle,
   XCircle,
-  AlertCircle
+  AlertCircle,
+  Folder,
+  Cloud,
+  ChevronDown,
+  X,
+  Check,
+  Building2,
+  ExternalLink
 } from "lucide-react";
 import { ClientGroup, PDDDocument } from "../types";
+import SharePointBrowserModal from "./SharePointBrowserModal";
 
 interface SourcesPanelProps {
   clientGroups: ClientGroup[];
@@ -58,7 +66,23 @@ export default function SourcesPanel({
   const [visibleLimit, setVisibleLimit] = useState(50);
   const [failedFiles, setFailedFiles] = useState<File[]>([]);
 
+  // Estados para Menu de Origem e Modal SharePoint
+  const [addMenuOpen, setAddMenuOpen] = useState(false);
+  const [showSharePointBrowser, setShowSharePointBrowser] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const addMenuRef = useRef<HTMLDivElement>(null);
+
+  // Fechar menu de adicionar ao clicar fora
+  useEffect(() => {
+    const handleClickOutside = (event: MouseEvent) => {
+      if (addMenuRef.current && !addMenuRef.current.contains(event.target as Node)) {
+        setAddMenuOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, []);
 
   // Sync / reset temporary local deletions when new database client groups load
   useEffect(() => {
@@ -94,7 +118,10 @@ export default function SourcesPanel({
   const allSelected = filteredFiles.length > 0 && filteredFiles.every(f => selectedFileIds.includes(f.id));
   const someSelected = filteredFiles.length > 0 && filteredFiles.some(f => selectedFileIds.includes(f.id)) && !allSelected;
 
-  const getFileIcon = (fileName: string) => {
+  const getFileIcon = (fileName: string, origin?: string) => {
+    if (origin === "SharePoint" || fileName.includes("[SharePoint]")) {
+      return <Cloud className="w-4 h-4 text-sky-500 flex-shrink-0" />;
+    }
     const ext = fileName.split(".").pop()?.toLowerCase() || "";
     if (["xlsx", "xls", "csv"].includes(ext)) {
       return <FileSpreadsheet className="w-4 h-4 text-emerald-400 flex-shrink-0" />;
@@ -103,6 +130,96 @@ export default function SourcesPanel({
       return <FileText className="w-4 h-4 text-blue-400 flex-shrink-0" />;
     }
     return <File className="w-4 h-4 text-slate-400 flex-shrink-0" />;
+  };
+
+  const handleImportSharePointFile = async (blob: Blob, fileName: string, folderPath: string) => {
+    setUploading(true);
+    setUploadStatus({ message: "", type: null });
+
+    const initialFilesState = {
+      [fileName]: { progress: 10, status: "uploading" as const, attempt: 1 }
+    };
+
+    setUploadProgress({
+      percent: 15,
+      statusText: `Baixando e preparando "${fileName}" do SharePoint...`,
+      files: initialFilesState
+    });
+
+    try {
+      const base64 = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const resStr = (reader.result as string).split(",")[1];
+          resolve(resStr);
+        };
+        reader.onerror = () => reject(new Error("Erro ao ler os dados binários do SharePoint."));
+        reader.readAsDataURL(blob);
+      });
+
+      setUploadProgress(prev => ({
+        percent: 60,
+        statusText: `Validando PDD e calculando embeddings para "${fileName}"...`,
+        files: {
+          [fileName]: { progress: 60, status: "uploading", attempt: 1 }
+        }
+      }));
+
+      const res = await fetch("/api/db/add-source", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: fileName,
+          type: blob.type || "application/octet-stream",
+          base64,
+          userEmail,
+          conversationId: activeSessionId,
+          origin: "SharePoint",
+          folderPath,
+          originalName: fileName
+        })
+      });
+
+      if (!res.ok) {
+        const data = await res.json().catch(() => ({}));
+        let msg = data.erro || data.error || "Erro ao processar o arquivo do SharePoint.";
+        if (data.justificativa) {
+          msg = `${msg} ${data.justificativa}`;
+        }
+        throw new Error(msg);
+      }
+
+      setUploadProgress(prev => ({
+        percent: 100,
+        statusText: `"${fileName}" indexado com sucesso a partir do SharePoint!`,
+        files: {
+          [fileName]: { progress: 100, status: "success", attempt: 1 }
+        }
+      }));
+
+      setUploadStatus({
+        message: `Documento "${fileName}" importado do SharePoint e indexado com sucesso!`,
+        type: "success"
+      });
+
+      onRefresh();
+    } catch (err: any) {
+      console.error("Erro na importação do SharePoint:", err);
+      setUploadProgress(prev => ({
+        percent: 100,
+        statusText: `Falha ao indexar "${fileName}".`,
+        files: {
+          [fileName]: { progress: 100, status: "error", attempt: 1, error: err.message }
+        }
+      }));
+      setUploadStatus({
+        message: `Erro ao importar do SharePoint: ${err.message}`,
+        type: "error"
+      });
+      throw err;
+    } finally {
+      setUploading(false);
+    }
   };
 
   const readFileAsBase64 = (file: File): Promise<string> => {
@@ -209,7 +326,15 @@ export default function SourcesPanel({
 
           if (!res.ok) {
             const data = await res.json().catch(() => ({}));
-            throw new Error(data.error || "Erro ao processar o arquivo.");
+            let msg = data.erro || data.error || "Erro ao processar o arquivo.";
+            if (data.justificativa) {
+              msg = `${msg} ${data.justificativa}`;
+            }
+            const errObj = new Error(msg);
+            if (res.status === 422) {
+              (errObj as any).isValidationError = true;
+            }
+            throw errObj;
           }
 
           updateFileProgress(file.name, 100, "success", attempt);
@@ -219,7 +344,10 @@ export default function SourcesPanel({
           const errorMsg = err.message || "Falha na indexação.";
           lastError = err;
           
-          if (attempt < MAX_RETRIES) {
+          if (err.isValidationError || attempt >= MAX_RETRIES) {
+            updateFileProgress(file.name, 100, "error", attempt, errorMsg);
+            break;
+          } else {
             const delay = attempt * 1200; // exponential/progressive backoff
             updateFileProgress(
               file.name, 
@@ -229,8 +357,6 @@ export default function SourcesPanel({
               `Falhou (Tentativa ${attempt}/${MAX_RETRIES}). Re-tentando em ${(delay / 1000).toFixed(1)}s...`
             );
             await new Promise(resolve => setTimeout(resolve, delay));
-          } else {
-            updateFileProgress(file.name, 100, "error", attempt, errorMsg);
           }
         }
       }
@@ -362,44 +488,105 @@ export default function SourcesPanel({
   };
 
   return (
-    <div className="w-80 bg-[#080B12] border-r border-white/5 flex flex-col h-full text-slate-300 z-10">
+    <div className="w-80 bg-[var(--cor-superficie)] border-r border-[var(--cor-borda)] flex flex-col h-full text-[var(--cor-texto)] z-10">
       
       {/* Header do Painel */}
-      <div className="p-4 border-b border-white/5 bg-[#080B12] flex items-center justify-between">
+      <div className="p-4 border-b border-[var(--cor-borda)] bg-[var(--cor-card-fundo)] flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <Layers className="w-4 h-4 text-blue-500" />
-          <span className="text-xs font-bold uppercase tracking-wider text-slate-200">
-            Fontes de Consulta
+          <Layers className="w-4 h-4 text-[var(--cor-primaria)]" />
+          <span className="text-sm font-semibold text-[var(--cor-texto)]">
+            Fontes de consulta
+          </span>
+          <span className="text-xs text-[var(--cor-texto-secundario)] font-normal ml-0.5" title="Capacidade expandida para até 500 fontes simultâneas">
+            ({files.filter(f => selectedFileIds.includes(f.id)).length}/500 arquivos)
           </span>
         </div>
-        <span className="text-[10px] font-mono bg-blue-500/10 text-blue-400 px-2 py-0.5 rounded-full border border-blue-500/20 font-semibold" title="Capacidade expandida para até 500 fontes simultâneas">
-          {files.filter(f => selectedFileIds.includes(f.id)).length}/500 ARQUIVOS
-        </span>
       </div>
 
-      {/* Botão Adicionar Fontes com Seletor de Arquivos */}
-      <div className="p-4 border-b border-white/5 bg-[#05070A]/40 space-y-3">
+      {/* Botão Adicionar Fontes com Seletor de Arquivos e SharePoint */}
+      <div className="p-4 border-b border-[var(--cor-borda)] bg-[var(--cor-superficie)] space-y-2.5 relative">
         <input 
           type="file" 
           ref={fileInputRef}
           onChange={handleFileChange}
           multiple
           accept="image/*, application/pdf, .xlsx, .docx, .txt"
-          className="hidden"
+          className="hidden" 
         />
         
-        <button
-          onClick={() => fileInputRef.current?.click()}
-          disabled={uploading}
-          className="w-full flex items-center justify-center gap-2 bg-blue-600 hover:bg-blue-500 disabled:bg-blue-800 text-white text-xs font-semibold py-2.5 px-4 rounded-lg transition-all shadow-[0_0_12px_rgba(37,99,235,0.3)] cursor-pointer"
-        >
-          {uploading ? (
-            <RefreshCw className="w-4 h-4 animate-spin text-blue-200" />
-          ) : (
-            <Plus className="w-4 h-4" />
+        {/* Menu Principal de Adicionar */}
+        <div className="relative" ref={addMenuRef}>
+          <button
+            type="button"
+            onClick={() => setAddMenuOpen(prev => !prev)}
+            disabled={uploading}
+            className="w-full flex items-center justify-between gap-2 bg-[var(--cor-balaousuario-fundo)] hover:opacity-95 disabled:opacity-50 text-white text-xs font-semibold py-2.5 px-3 rounded-lg transition-all shadow-xs cursor-pointer"
+          >
+            <div className="flex items-center gap-2">
+              {uploading ? (
+                <RefreshCw className="w-4 h-4 animate-spin text-white" />
+              ) : (
+                <Plus className="w-4 h-4" />
+              )}
+              <span>{uploading ? `Indexando: ${uploadProgress.percent}%` : "Adicionar fontes"}</span>
+            </div>
+            <ChevronDown className={`w-3.5 h-3.5 text-white transition-transform ${addMenuOpen ? "rotate-180" : ""}`} />
+          </button>
+
+          {/* Menu Suspenso de Opções */}
+          {addMenuOpen && (
+            <div className="absolute top-full left-0 right-0 mt-1.5 bg-[var(--cor-card-fundo)] border border-[var(--cor-borda)] rounded-xl shadow-xl p-1.5 z-40 animate-fade-in">
+              {/* Opção 1: Arquivo local */}
+              <button
+                type="button"
+                onClick={() => {
+                  setAddMenuOpen(false);
+                  fileInputRef.current?.click();
+                }}
+                className="w-full flex items-start gap-2.5 p-2 rounded-lg hover:bg-[var(--cor-hover)] text-left transition-colors cursor-pointer group"
+              >
+                <div className="p-1.5 rounded-md bg-[var(--cor-primaria-clara)] text-[var(--cor-primaria)] mt-0.5">
+                  <Folder className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-[var(--cor-texto)] flex items-center gap-1.5">
+                    <span>Arquivo local</span>
+                  </div>
+                  <div className="text-[10px] text-[var(--cor-texto-secundario)]">
+                    Upload de arquivos do seu computador
+                  </div>
+                </div>
+              </button>
+
+              <div className="my-1 border-t border-[var(--cor-borda)]" />
+
+              {/* Opção 2: SharePoint */}
+              <button
+                type="button"
+                onClick={() => {
+                  setAddMenuOpen(false);
+                  setShowSharePointBrowser(true);
+                }}
+                className="w-full flex items-start gap-2.5 p-2 rounded-lg hover:bg-[var(--cor-hover)] text-left transition-colors cursor-pointer group"
+              >
+                <div className="p-1.5 rounded-md bg-sky-500/10 text-sky-500 mt-0.5">
+                  <Cloud className="w-4 h-4" />
+                </div>
+                <div>
+                  <div className="text-xs font-semibold text-[var(--cor-texto)] flex items-center gap-1.5">
+                    <span>SharePoint</span>
+                    <span className="text-[9px] bg-sky-500/15 text-sky-600 dark:text-sky-400 px-1 rounded border border-sky-500/20 font-medium">
+                      Microsoft Graph
+                    </span>
+                  </div>
+                  <div className="text-[10px] text-[var(--cor-texto-secundario)]">
+                    Navegador de pastas do site corporativo
+                  </div>
+                </div>
+              </button>
+            </div>
           )}
-          <span>{uploading ? `Indexando: ${uploadProgress.percent}%` : "Adicionar fontes"}</span>
-        </button>
+        </div>
 
         {/* Drag and drop target área minimalista */}
         <div
@@ -407,30 +594,30 @@ export default function SourcesPanel({
           onDragOver={handleDrag}
           onDragLeave={handleDrag}
           onDrop={handleDrop}
-          className={`border border-dashed rounded-lg p-3 text-center transition-colors cursor-pointer ${
+          className={`border border-dashed rounded-lg p-2.5 text-center transition-colors cursor-pointer ${
             dragActive 
-              ? "border-blue-500 bg-blue-500/5 text-blue-400" 
-              : "border-white/10 hover:border-white/20 bg-white/[0.01] text-slate-500 hover:text-slate-400"
+              ? "border-[var(--cor-primaria)] bg-[var(--cor-primaria-clara)] text-[var(--cor-primaria)]" 
+              : "border-[var(--cor-borda)] hover:border-[var(--cor-borda-primaria)] bg-[var(--cor-card-fundo)] text-[var(--cor-texto-secundario)]"
           }`}
           onClick={() => fileInputRef.current?.click()}
         >
           <span className="text-[10px] font-sans block leading-relaxed">
-            Arraste PDF, XLSX, Word ou TXT aqui para indexar no chat
+            Arraste PDF, XLSX, Word ou pasta sincronizada aqui
           </span>
         </div>
 
         {/* Indicador de progresso geral do lote */}
         {uploading && (
-          <div className="p-2.5 rounded-lg border border-blue-500/20 bg-blue-500/5 space-y-2">
-            <div className="flex items-center justify-between text-[10px] font-medium text-slate-300">
-              <span className="truncate pr-1 text-slate-400">
+          <div className="p-2.5 rounded-lg border border-[var(--cor-borda-primaria)] bg-[var(--cor-primaria-clara)] space-y-2">
+            <div className="flex items-center justify-between text-xs font-medium text-[var(--cor-texto)]">
+              <span className="truncate pr-1 text-[var(--cor-texto-secundario)]">
                 {uploadProgress.statusText}
               </span>
-              <span className="font-mono text-blue-400 font-semibold">{uploadProgress.percent}%</span>
+              <span className="text-[var(--cor-primaria)] font-semibold">{uploadProgress.percent}%</span>
             </div>
-            <div className="w-full bg-slate-950 h-1.5 rounded-full overflow-hidden">
+            <div className="w-full bg-slate-200 h-1.5 rounded-full overflow-hidden">
               <div 
-                className="bg-blue-500 h-full rounded-full transition-all duration-300 ease-out"
+                className="bg-[#0F2942] h-full rounded-full transition-all duration-300 ease-out"
                 style={{ width: `${uploadProgress.percent}%` }}
               />
             </div>
@@ -450,7 +637,7 @@ export default function SourcesPanel({
               <XCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
             )}
             <div className="flex-1 min-w-0">
-              <span className="block truncate font-medium">{uploadStatus.message}</span>
+              <span className="block whitespace-normal break-words font-medium">{uploadStatus.message}</span>
             </div>
             <button 
               onClick={() => setUploadStatus({ message: "", type: null })}
@@ -483,16 +670,16 @@ export default function SourcesPanel({
       </div>
 
       {/* Campo de Busca Rápida / Filtro */}
-      <div className="px-4 py-2 border-b border-white/5 bg-[#05070A]/20">
+      <div className="px-4 py-2 border-b border-[var(--cor-borda)] bg-[var(--cor-card-fundo)]">
         <div className="relative">
           <input
             type="text"
             placeholder="Buscar fontes..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full bg-[#05070a] border border-white/10 rounded-lg px-3 py-1.5 pl-8 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-blue-500 transition-colors"
+            className="w-full bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-lg px-3 py-1.5 pl-8 text-xs text-[var(--cor-texto)] placeholder-[var(--cor-texto-secundario)] focus:outline-none focus:border-[var(--cor-primaria)] focus:bg-[var(--cor-card-fundo)] transition-colors"
           />
-          <span className="absolute left-2.5 top-2.5 text-slate-500">
+          <span className="absolute left-2.5 top-2.5 text-[var(--cor-texto-secundario)]">
             <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" viewBox="0 0 24 24">
               <path strokeLinecap="round" strokeLinejoin="round" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
             </svg>
@@ -500,7 +687,7 @@ export default function SourcesPanel({
           {searchQuery && (
             <button
               onClick={() => setSearchQuery("")}
-              className="absolute right-2.5 top-2.5 text-slate-500 hover:text-slate-300 font-mono text-[10px]"
+              className="absolute right-2.5 top-2.5 text-[var(--cor-texto-secundario)] hover:text-[var(--cor-texto)] text-[10px]"
             >
               ✕
             </button>
@@ -510,21 +697,21 @@ export default function SourcesPanel({
 
       {/* Opção Global: Selecionar Tudo */}
       {filteredFiles.length > 0 && (
-        <div className="p-3 bg-[#080B12] border-b border-white/5 flex items-center justify-between text-xs font-medium text-slate-400">
+        <div className="p-3 bg-[var(--cor-card-fundo)] border-b border-[var(--cor-borda)] flex items-center justify-between text-xs font-medium text-[var(--cor-texto)]">
           <button 
             onClick={() => onToggleAll(!allSelected)}
-            className="flex items-center gap-2 hover:text-slate-200 transition-colors cursor-pointer select-none"
+            className="flex items-center gap-2 hover:text-[var(--cor-primaria)] transition-colors cursor-pointer select-none"
           >
             {allSelected ? (
-              <CheckSquare className="w-4 h-4 text-blue-500" />
+              <CheckSquare className="w-4 h-4 text-[var(--cor-primaria)]" />
             ) : someSelected ? (
-              <CheckSquare className="w-4 h-4 text-blue-500/60" />
+              <CheckSquare className="w-4 h-4 text-[var(--cor-primaria)] opacity-60" />
             ) : (
-              <Square className="w-4 h-4 text-slate-600" />
+              <Square className="w-4 h-4 text-[var(--cor-texto-secundario)] hover:text-[var(--cor-primaria)]" />
             )}
             <span>Selecionar tudo</span>
           </button>
-          <span className="text-[10px] font-mono text-slate-500 uppercase tracking-widest">
+          <span className="text-xs text-[var(--cor-texto-secundario)] font-normal">
             {filteredFiles.length} de {files.length} arquivos
           </span>
         </div>
@@ -588,7 +775,7 @@ export default function SourcesPanel({
                       ) : (
                         <RefreshCw className="w-3.5 h-3.5 text-blue-400 animate-spin flex-shrink-0" />
                       )}
-                      <span className={`truncate pr-1 block font-sans font-medium ${isError ? "text-rose-200" : "text-slate-200"}`}>
+                      <span className={`truncate pr-1 block font-sans font-medium ${isError ? "text-rose-700" : "text-[var(--cor-texto)]"}`}>
                         {name}
                       </span>
                     </div>
@@ -599,10 +786,10 @@ export default function SourcesPanel({
                     )}
                   </div>
                   
-                  <div className="text-[9px] font-mono flex items-center justify-between">
-                    <span className={isError ? "text-rose-400 font-medium" : "text-slate-500"}>
+                  <div className="text-[9px] font-mono flex items-start justify-between gap-2">
+                    <span className={isError ? "text-rose-400 font-medium whitespace-normal break-words leading-relaxed" : "text-slate-500"}>
                       {isError 
-                        ? `Falhou: ${info.error || "Erro desconhecido"}` 
+                        ? (info.error || "Falha na indexação.") 
                         : info.status === "uploading" 
                           ? (info.error || "Processando e indexando...")
                           : "Na fila..."}
@@ -628,18 +815,18 @@ export default function SourcesPanel({
             })}
 
             {files.length === 0 && !uploading ? (
-              <div className="text-center py-12 px-4 text-xs text-slate-500 space-y-2">
-                <HelpCircle className="w-8 h-8 text-slate-600 mx-auto opacity-40" />
-                <p className="font-medium">Nenhuma fonte disponível.</p>
-                <p className="text-[10px] text-slate-600 leading-relaxed">
+              <div className="text-center py-12 px-4 text-xs text-[var(--cor-texto-secundario)] space-y-2">
+                <HelpCircle className="w-8 h-8 text-slate-400 mx-auto opacity-40" />
+                <p className="font-medium text-[var(--cor-texto)]">Nenhuma fonte disponível.</p>
+                <p className="text-[11px] text-[var(--cor-texto-secundario)] leading-relaxed">
                   Adicione arquivos locais ou realize a sincronização para carregar as fontes do seu robô.
                 </p>
               </div>
             ) : filteredFiles.length === 0 && files.length > 0 ? (
-              <div className="text-center py-12 px-4 text-xs text-slate-500 space-y-2">
-                <HelpCircle className="w-8 h-8 text-slate-600 mx-auto opacity-40" />
-                <p className="font-medium">Nenhum resultado encontrado.</p>
-                <p className="text-[10px] text-slate-600 leading-relaxed">
+              <div className="text-center py-12 px-4 text-xs text-[var(--cor-texto-secundario)] space-y-2">
+                <HelpCircle className="w-8 h-8 text-slate-400 mx-auto opacity-40" />
+                <p className="font-medium text-[var(--cor-texto)]">Nenhum resultado encontrado.</p>
+                <p className="text-[11px] text-[var(--cor-texto-secundario)] leading-relaxed">
                   Tente buscar com termos diferentes.
                 </p>
               </div>
@@ -654,8 +841,8 @@ export default function SourcesPanel({
                     onClick={() => onToggleFile(file.id)}
                     className={`flex items-center justify-between gap-2 p-2 rounded-lg cursor-pointer border transition-all text-xs group ${
                       isSelected 
-                        ? "bg-blue-600/5 border-blue-500/10 text-slate-200 hover:bg-blue-600/10" 
-                        : "bg-transparent border-transparent text-slate-500 hover:text-slate-300 hover:bg-white/[0.02]"
+                        ? "bg-[var(--cor-primaria-clara)] border-[var(--cor-borda-primaria)] text-[var(--cor-texto)] hover:bg-[var(--cor-hover)]" 
+                        : "bg-[var(--cor-card-fundo)] border-[var(--cor-borda)] text-[var(--cor-texto)] hover:bg-[var(--cor-hover)]"
                     }`}
                     title={`${file.name} (${file.clientName} | ${file.robotName})`}
                   >
@@ -663,34 +850,38 @@ export default function SourcesPanel({
                       {/* Checkbox */}
                       <div className="flex-shrink-0">
                         {isSelected ? (
-                          <CheckSquare className="w-4 h-4 text-blue-500" />
+                          <CheckSquare className="w-4 h-4 text-[var(--cor-primaria)]" />
                         ) : (
-                          <Square className="w-4 h-4 text-slate-700 hover:text-slate-500" />
+                          <Square className="w-4 h-4 text-[var(--cor-texto-secundario)] hover:text-[var(--cor-primaria)]" />
                         )}
                       </div>
 
                       {/* Ícone do Formato */}
-                      {getFileIcon(file.name)}
+                      {getFileIcon(file.name, file.origin)}
 
                       {/* Nome do Arquivo (Truncado com reticências) */}
                       <div className="flex flex-col min-w-0">
-                        <span className="truncate font-medium block pr-1">
+                        <span className="truncate font-medium block pr-1 text-[var(--cor-texto)]">
                           {file.name}
                         </span>
-                        <span className="text-[8px] font-mono text-slate-500 truncate block">
-                          {isUploaded ? "Upload Manual" : `${file.clientName.split(" (")[0]}`}
+                        <span className="text-[10px] text-[var(--cor-texto-secundario)] truncate block">
+                          {file.origin === "SharePoint" || file.clientId === "sharepoint"
+                            ? `SharePoint • ${file.folderPath || file.robotName}`
+                            : isUploaded
+                            ? "Arquivo local"
+                            : `${file.clientName.split(" (")[0]}`}
                         </span>
                       </div>
                     </div>
 
                     {/* Ação de Excluir Fonte / Tamanho do Arquivo */}
                     <div className="flex items-center gap-2 flex-shrink-0">
-                      <span className="text-[9px] font-mono text-slate-500">
+                      <span className="text-[10px] text-[var(--cor-texto-secundario)]">
                         {file.size || "15 KB"}
                       </span>
                       <button
                         onClick={(e) => handleDelete(e, file.id)}
-                        className="p-1.5 text-slate-400 hover:text-rose-400 hover:bg-rose-500/10 rounded-md transition-colors cursor-pointer"
+                        className="p-1.5 text-[var(--cor-texto-secundario)] hover:text-rose-600 hover:bg-rose-500/10 rounded-md transition-colors cursor-pointer"
                         title="Excluir fonte permanentemente"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
@@ -705,10 +896,17 @@ export default function SourcesPanel({
       </div>
 
       {/* Rodapé descritivo sutil */}
-      <div className="p-3 bg-[#05070A] border-t border-white/5 text-[9px] text-slate-500 font-mono flex items-center justify-center gap-1">
-        <Sparkles className="w-3 h-3 text-blue-500 animate-pulse" />
+      <div className="p-3 bg-[var(--cor-card-fundo)] border-t border-[var(--cor-borda)] text-xs text-[var(--cor-texto-secundario)] flex items-center justify-center gap-1.5">
+        <Sparkles className="w-3 h-3 text-[var(--cor-primaria)]" />
         <span>Contexto dinâmico ativo</span>
       </div>
+
+      {/* Navegador de Pastas do SharePoint via Microsoft Graph com Sites.Selected */}
+      <SharePointBrowserModal
+        isOpen={showSharePointBrowser}
+        onClose={() => setShowSharePointBrowser(false)}
+        onImport={handleImportSharePointFile}
+      />
     </div>
   );
 }
