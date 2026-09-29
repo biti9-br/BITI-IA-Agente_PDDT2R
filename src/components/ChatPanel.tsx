@@ -3,13 +3,13 @@ import { Send, Sparkles, RefreshCw, FileText, Bot, User, CheckCircle, XCircle, C
 import { ChatMessage, ClientGroup, ChatSession } from "../types";
 import { auth } from "../firebase";
 import { 
-  salvarConversa, 
   salvarSessaoFirestore, 
   carregarSessoesFirestore, 
   excluirSessaoFirestore, 
   renomearSessaoFirestore 
 } from "../services/conversas";
-import { salvarConsultaPDF, gerarBlobPDF } from "../services/consultas";
+import { gerarBlobPDF } from "../services/consultas";
+import { apiFetch } from "../services/api";
 
 interface ChatPanelProps {
   selectedClientId: string;
@@ -38,6 +38,29 @@ const QUICK_PROMPTS = [
   "Quais sites ou sistemas o emissor de notas fiscais acessa?"
 ];
 
+const WELCOME_FULL_TEXT = "Olá,! sou o **Robbi9**, assistente de consultas da **Biti9**\n\nFui treinado para analisar os seus **Process Design Documents (PDDs)** e planilhas/documentos **T2R**.\n\nComo posso ajudar você hoje?";
+
+function normalizeWelcomeInSessions(sessList: ChatSession[]): ChatSession[] {
+  return sessList.map(s => ({
+    ...s,
+    messages: (s.messages || []).map(m => {
+      if (m.sender === "assistant" && (
+        m.id === "welcome" ||
+        m.id.startsWith("welcome") ||
+        m.text?.toLowerCase().includes("assistente de consultas") ||
+        m.text?.toLowerCase().includes("robbi9") ||
+        m.text?.toLowerCase().includes("especialista em rpa")
+      )) {
+        return {
+          ...m,
+          text: WELCOME_FULL_TEXT
+        };
+      }
+      return m;
+    })
+  }));
+}
+
 // Helper para criar uma sessão inicial com saudação limpa
 function createInitialSession(uid?: string): ChatSession {
   return {
@@ -47,7 +70,7 @@ function createInitialSession(uid?: string): ChatSession {
       {
         id: "welcome",
         sender: "assistant",
-        text: "Olá! Sou o **robbi9**, assistente de consultas da **biti9**.\n\nFui treinado para analisar os seus **Process Design Documents (PDDs)** e planilhas/documentos **T2R**.\n\nSeu histórico de conversas é 100% individual e privado, protegido e vinculado com exclusividade ao seu usuário corporativo.\n\nComo posso ajudar você hoje?",
+        text: WELCOME_FULL_TEXT,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
       }
     ],
@@ -121,13 +144,14 @@ export default function ChatPanel({
     }
 
     if (initialUserSessions.length > 0) {
-      setSessions(initialUserSessions);
+      const normalizedInitial = normalizeWelcomeInSessions(initialUserSessions);
+      setSessions(normalizedInitial);
       const savedActiveId = localStorage.getItem(currentActiveKey);
-      if (savedActiveId && initialUserSessions.some(s => s.id === savedActiveId)) {
+      if (savedActiveId && normalizedInitial.some(s => s.id === savedActiveId)) {
         setActiveSessionId(savedActiveId);
         if (onSessionChange) onSessionChange(savedActiveId);
       } else {
-        const firstId = initialUserSessions[0].id;
+        const firstId = normalizedInitial[0].id;
         setActiveSessionId(firstId);
         if (onSessionChange) onSessionChange(firstId);
       }
@@ -145,15 +169,16 @@ export default function ChatPanel({
         .then((remoteSessions) => {
           if (isCancelled) return;
           if (remoteSessions && remoteSessions.length > 0) {
-            setSessions(remoteSessions);
-            localStorage.setItem(currentStorageKey, JSON.stringify(remoteSessions));
+            const normalizedRemote = normalizeWelcomeInSessions(remoteSessions);
+            setSessions(normalizedRemote);
+            localStorage.setItem(currentStorageKey, JSON.stringify(normalizedRemote));
 
             const savedActiveId = localStorage.getItem(currentActiveKey);
-            if (savedActiveId && remoteSessions.some(s => s.id === savedActiveId)) {
+            if (savedActiveId && normalizedRemote.some(s => s.id === savedActiveId)) {
               setActiveSessionId(savedActiveId);
               if (onSessionChange) onSessionChange(savedActiveId);
             } else {
-              const firstId = remoteSessions[0].id;
+              const firstId = normalizedRemote[0].id;
               setActiveSessionId(firstId);
               if (onSessionChange) onSessionChange(firstId);
             }
@@ -192,35 +217,31 @@ export default function ChatPanel({
   const [isHistoryOpen, setIsHistoryOpen] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState<string | null>(null);
   const [editingTitle, setEditingTitle] = useState<string>("");
-  const [salvandoPdfMsgId, setSalvandoPdfMsgId] = useState<string | null>(null);
+  const [baixandoPdfMsgId, setBaixandoPdfMsgId] = useState<string | null>(null);
 
-  const handleSalvarPDF = async (msg: ChatMessage) => {
-    if (!userId) {
-      setToast({ show: true, message: "Faça login para salvar PDFs no Storage e Firestore.", type: "error" });
-      return;
-    }
+  const handleBaixarPDF = (msg: ChatMessage) => {
     try {
-      setSalvandoPdfMsgId(msg.id);
+      setBaixandoPdfMsgId(msg.id);
       const titulo = activeSession.title || "Consulta de Automação biti9";
-      const blob = gerarBlobPDF(titulo, "PDD/T2R", msg.text);
-      const url = await salvarConsultaPDF(userId, blob, titulo, "PDD/T2R");
-      setToast({
-        show: true,
-        message: "PDF salvo com sucesso no Firebase Storage e Firestore!",
-        type: "success"
-      });
-      if (typeof window !== "undefined") {
-        window.open(url, "_blank");
-      }
+      const blob = gerarBlobPDF(titulo, "Consulta", msg.text);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      const safeTitle = titulo.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 30);
+      a.download = `Consulta_${safeTitle}_${Date.now()}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
     } catch (err: any) {
-      console.error("Erro ao salvar PDF:", err);
+      console.error("Erro ao gerar PDF:", err);
       setToast({
         show: true,
-        message: `Erro ao salvar PDF: ${err?.message || "Tente novamente."}`,
+        message: `Erro ao baixar PDF: ${err?.message || "Tente novamente."}`,
         type: "error"
       });
     } finally {
-      setSalvandoPdfMsgId(null);
+      setBaixandoPdfMsgId(null);
     }
   };
 
@@ -263,12 +284,11 @@ export default function ChatPanel({
 
     // 3. Notificar backend se necessário
     try {
-      await fetch(`/api/conversations/${encodeURIComponent(sessionId)}`, {
+      await apiFetch(`/api/conversations/${encodeURIComponent(sessionId)}`, {
         method: "PATCH",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          title: trimmed,
-          userEmail
+          title: trimmed
         })
       });
     } catch (err) {
@@ -289,6 +309,7 @@ export default function ChatPanel({
   const [expandedSourceKey, setExpandedSourceKey] = useState<string | null>(null);
   const [currentSources, setCurrentSources] = useState<any[]>([]);
   const [attachedFiles, setAttachedFiles] = useState<Array<{ name: string; type: string; base64: string }>>([]);
+  const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -338,7 +359,7 @@ export default function ChatPanel({
         {
           id: `welcome_${Date.now()}`,
           sender: "assistant",
-          text: "Olá! Sou o **Especialista em RPA da biti9**.\n\nFaça suas perguntas sobre processos, regras de negócio ou fluxos de robôs. Todo o seu histórico é **privado e individual**!",
+          text: WELCOME_FULL_TEXT,
           timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
         }
       ],
@@ -441,12 +462,14 @@ export default function ChatPanel({
     const files = e.target.files;
     if (!files || files.length === 0) return;
 
-    const validExtensions = ['.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.csv', '.docx', '.txt'];
+    const validExtensions = ['.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.xls', '.docx', '.doc', '.csv', '.txt'];
+    setAttachmentError(null);
     
     Array.from(files).forEach((file: any) => {
       const fileExtension = '.' + file.name.split('.').pop()?.toLowerCase();
-      if (!validExtensions.includes(fileExtension)) {
-        alert(`O arquivo "${file.name}" tem um formato não suportado. Escolha imagens (.png, .jpg, .jpeg) ou documentos (.pdf, .xlsx, .csv, .docx, .txt).`);
+      if (!validExtensions.includes(fileExtension) && !file.type.startsWith("image/")) {
+        setAttachmentError(`Formato "${fileExtension}" não suportado. Escolha imagens, PDF, DOCX, XLSX, CSV ou TXT.`);
+        setTimeout(() => setAttachmentError(null), 5000);
         return;
       }
 
@@ -487,12 +510,14 @@ export default function ChatPanel({
     const files = e.dataTransfer.files;
     if (!files || files.length === 0) return;
 
-    const validExtensions = ['.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.csv', '.docx', '.txt'];
+    const validExtensions = ['.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.xls', '.docx', '.doc', '.csv', '.txt'];
+    setAttachmentError(null);
     
     Array.from(files).forEach((file: any) => {
       const fileExtension = '.' + file.name.split('.').pop()?.toLowerCase();
-      if (!validExtensions.includes(fileExtension)) {
-        alert(`O arquivo "${file.name}" tem um formato não suportado. Escolha imagens (.png, .jpg, .jpeg) ou documentos (.pdf, .xlsx, .csv, .docx, .txt).`);
+      if (!validExtensions.includes(fileExtension) && !file.type.startsWith("image/")) {
+        setAttachmentError(`Formato "${fileExtension}" não suportado. Escolha imagens, PDF, DOCX, XLSX, CSV ou TXT.`);
+        setTimeout(() => setAttachmentError(null), 5000);
         return;
       }
 
@@ -556,6 +581,27 @@ export default function ChatPanel({
     setLoading(true);
     setExpandedSourceKey(null);
 
+    const assistantMessageId = `msg_${Date.now() + 1}`;
+    const initialAssistantMessage: ChatMessage = {
+      id: assistantMessageId,
+      sender: "assistant",
+      text: "",
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      sources: []
+    };
+
+    setSessions(prevSessions => {
+      return prevSessions.map(sess => {
+        if (sess.id === activeSession.id) {
+          return {
+            ...sess,
+            messages: [...sess.messages, initialAssistantMessage]
+          };
+        }
+        return sess;
+      });
+    });
+
     try {
       // Histórico das últimas 5 mensagens da sessão ativa
       const historyContext = messages.slice(-5).map(m => ({
@@ -563,26 +609,11 @@ export default function ChatPanel({
         text: m.text
       }));
 
-      // Obter ID Token do Firebase Auth para autorização segura e busca vetorial de histórico
-      let idToken = token;
-      if (!idToken && auth.currentUser) {
-        try {
-          idToken = await auth.currentUser.getIdToken();
-        } catch (tokErr) {
-          console.warn("Aviso ao obter Firebase ID token:", tokErr);
-        }
-      }
-
-      const headers: Record<string, string> = {
-        "Content-Type": "application/json"
-      };
-      if (idToken) {
-        headers["Authorization"] = `Bearer ${idToken}`;
-      }
-
-      const res = await fetch("/api/chat", {
+      const res = await apiFetch("/api/chat", {
         method: "POST",
-        headers,
+        headers: {
+          "Content-Type": "application/json"
+        },
         body: JSON.stringify({
           question: textToSend || `Analise os arquivos anexados: ${filesToUpload.map(f => f.name).join(", ")}`,
           clientId: selectedClientId,
@@ -590,7 +621,6 @@ export default function ChatPanel({
           history: historyContext,
           sessionId: activeSession.id,
           attachments: filesToUpload.map(f => ({ name: f.name, type: f.type, base64: f.base64 })),
-          userEmail: userEmail,
           selectedFileIds: selectedFileIds
         })
       });
@@ -601,126 +631,254 @@ export default function ChatPanel({
         throw new Error(detailedError);
       }
 
-      const data = await res.json();
-      const assistantMessageId = `msg_${Date.now() + 1}`;
+      if (!res.body) {
+        throw new Error("Não foi possível estabelecer fluxo de leitura com o servidor.");
+      }
 
-      const initialAssistantMessage: ChatMessage = {
-        id: assistantMessageId,
-        sender: "assistant",
-        text: "",
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-        sources: data.sources
-      };
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder("utf-8");
+      let accumulatedText = "";
+      let receivedSources: any[] = [];
+      let buffer = "";
 
-      setSessions(prevSessions => {
-        return prevSessions.map(sess => {
+      setLoading(false);
+      setIsTyping(true);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split("\n");
+        buffer = lines.pop() || "";
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed || !trimmed.startsWith("data:")) continue;
+
+          const dataStr = trimmed.replace(/^data:\s*/, "");
+          try {
+            const parsed = JSON.parse(dataStr);
+            if (parsed.error) {
+              throw new Error(parsed.error);
+            }
+            if (parsed.text) {
+              accumulatedText += parsed.text;
+              setSessions(prevSessions =>
+                prevSessions.map(sess => {
+                  if (sess.id === activeSession.id) {
+                    return {
+                      ...sess,
+                      messages: sess.messages.map(m =>
+                        m.id === assistantMessageId ? { ...m, text: accumulatedText } : m
+                      )
+                    };
+                  }
+                  return sess;
+                })
+              );
+            }
+            if (parsed.sources) {
+              receivedSources = parsed.sources;
+            }
+          } catch (err: any) {
+            if (err.message && !err.message.includes("JSON")) {
+              throw err;
+            }
+          }
+        }
+      }
+
+      // Processa restante eventual no buffer
+      if (buffer.trim().startsWith("data:")) {
+        const dataStr = buffer.trim().replace(/^data:\s*/, "");
+        try {
+          const parsed = JSON.parse(dataStr);
+          if (parsed.text) {
+            accumulatedText += parsed.text;
+          }
+          if (parsed.sources) {
+            receivedSources = parsed.sources;
+          }
+        } catch {}
+      }
+
+      // Atualização final com o texto consolidado e fontes
+      setSessions(prevSessions =>
+        prevSessions.map(sess => {
           if (sess.id === activeSession.id) {
             return {
               ...sess,
-              messages: [...sess.messages, initialAssistantMessage]
+              messages: sess.messages.map(m =>
+                m.id === assistantMessageId
+                  ? { ...m, text: accumulatedText || "Sem resposta obtida.", sources: receivedSources }
+                  : m
+              )
             };
           }
           return sess;
-        });
-      });
+        })
+      );
 
-      if (data.sources && data.sources.length > 0) {
-        setCurrentSources(data.sources);
+      if (receivedSources.length > 0) {
+        setCurrentSources(receivedSources);
       } else {
         setCurrentSources([]);
       }
 
-      // Efeito de digitação suave (Simulando streaming de texto)
-      setIsTyping(true);
-      const fullText = data.answer || "Desculpe, não consegui obter resposta.";
-      const words = fullText.split(" ");
-      let currentWordIdx = 0;
+      setIsTyping(false);
 
-      const typeNextWord = () => {
-        if (currentWordIdx < words.length) {
-          const nextText = words.slice(0, currentWordIdx + 1).join(" ");
-          setSessions(prevSessions => {
-            return prevSessions.map(sess => {
-              if (sess.id === activeSession.id) {
-                return {
-                  ...sess,
-                  messages: sess.messages.map(m => {
-                    if (m.id === assistantMessageId) {
-                      return { ...m, text: nextText };
-                    }
-                    return m;
-                  })
-                };
-              }
-              return sess;
-            });
-          });
-          currentWordIdx++;
-          setTimeout(typeNextWord, 15);
-        } else {
-          setIsTyping(false);
-          setLoading(false);
-          if (userId) {
-            // Sincroniza a sessão completa no Firestore do usuário autenticado
-            setSessions(latest => {
-              const current = latest.find(s => s.id === activeSession.id);
-              if (current) {
-                salvarSessaoFirestore(userId, current).catch(err =>
-                  console.warn("Aviso ao salvar sessão completa no Firestore:", err)
-                );
-              }
-              return latest;
-            });
-
-            salvarConversa(userId, [
-              ...activeSession.messages.map(m => ({
-                role: m.sender === "user" ? "user" : "assistant",
-                content: m.text
-              })),
-              { role: "assistant", content: fullText }
-            ]).catch(err => console.warn("Aviso ao salvar conversa no Firestore:", err));
+      if (userId && auth.currentUser && auth.currentUser.uid === userId) {
+        setSessions(latest => {
+          const current = latest.find(s => s.id === activeSession.id);
+          if (current) {
+            salvarSessaoFirestore(userId, current).catch(err =>
+              console.warn("Aviso ao salvar sessão completa no Firestore:", err)
+            );
           }
-        }
-      };
-
-      // Inicia o fluxo de digitação
-      typeNextWord();
-
+          return latest;
+        });
+      }
     } catch (e: any) {
       console.error(e);
-      const errorMessage: ChatMessage = {
-        id: `msg_err_${Date.now()}`,
-        sender: "assistant",
-        text: `Erro no Chat Especialista: ${e.message || "Erro desconhecido."}`,
-        isError: true,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-      };
-
       setSessions(prevSessions => {
         return prevSessions.map(sess => {
           if (sess.id === activeSession.id) {
+            const hasInitial = sess.messages.some(m => m.id === assistantMessageId);
+            if (hasInitial) {
+              return {
+                ...sess,
+                messages: sess.messages.map(m =>
+                  m.id === assistantMessageId
+                    ? {
+                        ...m,
+                        text: `Erro no Chat Especialista: ${e.message || "Erro desconhecido."}`,
+                        isError: true
+                      }
+                    : m
+                )
+              };
+            }
             return {
               ...sess,
-              messages: [...sess.messages, errorMessage]
+              messages: [
+                ...sess.messages,
+                {
+                  id: `msg_err_${Date.now()}`,
+                  sender: "assistant",
+                  text: `Erro no Chat Especialista: ${e.message || "Erro desconhecido."}`,
+                  isError: true,
+                  timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+                }
+              ]
             };
           }
           return sess;
         });
       });
       setLoading(false);
+      setIsTyping(false);
     }
   };
 
-  // Renderiza textos markdown simples (bold, itálico, tópicos) de forma limpa e bonita
+  // Renderiza textos markdown completos (títulos, listas, negrito, tabelas e fontes) de forma limpa e bonita
   const formatMarkdown = (text: string) => {
-    return text.split("\n").map((line, i) => {
-      let content = line;
-      
+    let normalizedText = text;
+    normalizedText = normalizedText.replace(
+      /Olá[!, ]*sou o \*{0,2}robbi9\*{0,2},?\s*assistente de consultas da \*{0,2}biti9\*{0,2}\.?/gi,
+      "Olá,! sou o **Robbi9**, assistente de consultas da **Biti9**"
+    );
+    normalizedText = normalizedText.replace(
+      /Olá[!, ]*sou o \*{0,2}especialista em rpa da biti9\*{0,2}\.?/gi,
+      "Olá,! sou o **Robbi9**, assistente de consultas da **Biti9**"
+    );
+    normalizedText = normalizedText.replace(
+      /Seu histórico de conversas é 100% individual e privado[^\n]*\n*/gi,
+      ""
+    );
+
+    const lines = normalizedText.split("\n");
+    const elements: React.ReactNode[] = [];
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const trimmed = line.trim();
+
+      // Suporte a tabelas Markdown (| Col 1 | Col 2 |)
+      if (trimmed.startsWith("|") && trimmed.endsWith("|") && trimmed.split("|").length >= 3) {
+        const tableLines: string[] = [];
+        while (i < lines.length && lines[i].trim().startsWith("|") && lines[i].trim().endsWith("|")) {
+          tableLines.push(lines[i].trim());
+          i++;
+        }
+
+        if (tableLines.length >= 2) {
+          const headerCells = tableLines[0]
+            .split("|")
+            .slice(1, -1)
+            .map(c => c.trim());
+
+          let startIndex = 1;
+          // Pula a linha divisória (|---|---|) se ela contiver apenas hífens, dois-pontos e pipes
+          if (tableLines[1].replace(/[\s|:-]/g, "").length === 0) {
+            startIndex = 2;
+          }
+
+          const bodyRows = tableLines.slice(startIndex).map(tl =>
+            tl
+              .split("|")
+              .slice(1, -1)
+              .map(c => c.trim())
+          );
+
+          elements.push(
+            <div key={`table_${i}`} className="my-2.5 overflow-x-auto rounded-lg border border-[var(--cor-borda)] bg-[var(--cor-superficie)] shadow-2xs">
+              <table className="w-full text-left text-xs border-collapse">
+                <thead className="bg-slate-100/80 border-b border-[var(--cor-borda)] text-[var(--cor-texto)] font-semibold">
+                  <tr>
+                    {headerCells.map((h, hIdx) => (
+                      <th key={hIdx} className="px-3 py-2 border-r border-[var(--cor-borda)] last:border-r-0">
+                        {renderInlineStyles(h)}
+                      </th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-[var(--cor-borda)]">
+                  {bodyRows.map((row, rIdx) => (
+                    <tr key={rIdx} className="hover:bg-slate-50/50">
+                      {row.map((cell, cIdx) => (
+                        <td key={cIdx} className="px-3 py-2 border-r border-[var(--cor-borda)] last:border-r-0 text-[var(--cor-texto)]">
+                          {renderInlineStyles(cell)}
+                        </td>
+                      ))}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          );
+          continue;
+        }
+      }
+
+      // Linha discreta de fontes ao final da resposta
+      if (trimmed.startsWith("Fontes:") || trimmed.startsWith("Fonte:")) {
+        elements.push(
+          <div key={`src_${i}`} className="text-[11px] text-[var(--cor-texto-secundario)] mt-3 pt-2 border-t border-[var(--cor-borda)] font-medium flex items-center gap-1.5">
+            <FileText className="w-3.5 h-3.5 text-[var(--cor-primaria)] shrink-0" />
+            <span>{renderInlineStyles(trimmed)}</span>
+          </div>
+        );
+        i++;
+        continue;
+      }
+
       // Suporte a imagens no formato ![alt](url)
-      const imgMatch = content.match(/^!\[(.*?)\]\((.*?)\)/);
+      const imgMatch = line.match(/^!\[(.*?)\]\((.*?)\)/);
       if (imgMatch) {
-        return (
-          <div key={i} className="my-3 flex justify-center w-full">
+        elements.push(
+          <div key={`img_${i}`} className="my-3 flex justify-center w-full">
             <img 
               src={imgMatch[2]} 
               alt={imgMatch[1]} 
@@ -729,71 +887,99 @@ export default function ChatPanel({
             />
           </div>
         );
-      }
-      
-      // Cabeçalhos (### ou ##)
-      if (content.startsWith("### ")) {
-        return <h4 key={i} className="text-sm font-semibold text-[var(--cor-texto)] mt-3 mb-1.5">{content.replace("### ", "")}</h4>;
-      }
-      if (content.startsWith("## ")) {
-        return <h3 key={i} className="text-base font-bold text-[var(--cor-texto)] mt-4 mb-2">{content.replace("## ", "")}</h3>;
-      }
-      if (content.startsWith("# ")) {
-        return <h2 key={i} className="text-lg font-bold text-[var(--cor-texto)] mt-4 mb-2">{content.replace("# ", "")}</h2>;
+        i++;
+        continue;
       }
 
-      // Tópicos com asterisco ou hífen
-      if (content.trim().startsWith("* ") || content.trim().startsWith("- ")) {
-        const cleaned = content.replace(/^[\s*-]+/, "");
-        return (
-          <div key={i} className="flex items-start gap-2 pl-3 my-1">
+      // Cabeçalhos Markdown (#, ##, ###, ####)
+      if (line.startsWith("#### ")) {
+        elements.push(<h5 key={`h5_${i}`} className="text-xs font-semibold text-[var(--cor-texto)] mt-2 mb-1">{line.replace("#### ", "")}</h5>);
+        i++;
+        continue;
+      }
+      if (line.startsWith("### ")) {
+        elements.push(<h4 key={`h4_${i}`} className="text-xs font-semibold text-[var(--cor-texto)] mt-2.5 mb-1">{line.replace("### ", "")}</h4>);
+        i++;
+        continue;
+      }
+      if (line.startsWith("## ")) {
+        elements.push(<h3 key={`h3_${i}`} className="text-sm font-bold text-[var(--cor-texto)] mt-3 mb-1.5">{line.replace("## ", "")}</h3>);
+        i++;
+        continue;
+      }
+      if (line.startsWith("# ")) {
+        elements.push(<h2 key={`h2_${i}`} className="text-base font-bold text-[var(--cor-texto)] mt-4 mb-2">{line.replace("# ", "")}</h2>);
+        i++;
+        continue;
+      }
+
+      // Tópicos com marcadores (*, -, •)
+      if (trimmed.startsWith("* ") || trimmed.startsWith("- ") || trimmed.startsWith("• ")) {
+        const cleaned = trimmed.replace(/^[\s*-•]+/, "");
+        elements.push(
+          <div key={`bullet_${i}`} className="flex items-start gap-2 pl-2 my-1">
             <span className="text-[var(--cor-primaria)] select-none mt-1.5 text-[6px]">●</span>
-            <span className="text-sm leading-relaxed">{renderInlineStyles(cleaned)}</span>
+            <span className="text-xs leading-relaxed">{renderInlineStyles(cleaned)}</span>
           </div>
         );
+        i++;
+        continue;
       }
 
-      // Tópicos numerados
-      const numMatch = content.trim().match(/^(\d+)\.\s(.*)/);
+      // Tópicos numerados (1. , 2. )
+      const numMatch = trimmed.match(/^(\d+)\.\s(.*)/);
       if (numMatch) {
-        return (
-          <div key={i} className="flex items-start gap-2 pl-3 my-1">
-            <span className="text-[var(--cor-primaria)] text-xs font-semibold">{numMatch[1]}.</span>
-            <span className="text-sm leading-relaxed">{renderInlineStyles(numMatch[2])}</span>
+        elements.push(
+          <div key={`num_${i}`} className="flex items-start gap-2 pl-2 my-1">
+            <span className="text-[var(--cor-primaria)] text-xs font-semibold shrink-0">{numMatch[1]}.</span>
+            <span className="text-xs leading-relaxed">{renderInlineStyles(numMatch[2])}</span>
           </div>
         );
+        i++;
+        continue;
       }
 
-      return (
-        <p key={i} className="text-sm leading-relaxed my-1.5 min-h-[1px]">
-          {renderInlineStyles(content)}
-        </p>
-      );
-    });
+      // Linha vazia ou parágrafo comum
+      if (trimmed === "") {
+        elements.push(<div key={`blank_${i}`} className="h-1.5" />);
+      } else {
+        elements.push(
+          <p key={`p_${i}`} className="text-xs leading-relaxed my-1 min-h-[1px]">
+            {renderInlineStyles(line)}
+          </p>
+        );
+      }
+      i++;
+    }
+
+    return elements;
   };
 
   const renderInlineStyles = (txt: string) => {
-    const parts = txt.split(/(\*\*.*?\*\*|`.*?`|\(Fonte:[^)]+\)|\[\[SEM_INFORMACAO\]\])/g);
+    const parts = txt.split(/(\*\*.*?\*\*|\*[^*\n]+?\*|`.*?`|\(Fonte:[^)]+\)|\[\[SEM_INFORMACAO\]\])/g);
     return parts.map((part, idx) => {
       if (part.startsWith("**") && part.endsWith("**")) {
         return <strong key={idx} className="font-semibold text-inherit">{part.slice(2, -2)}</strong>;
       }
+      if (part.startsWith("*") && part.endsWith("*") && part.length > 2) {
+        return <em key={idx} className="italic text-inherit">{part.slice(1, -1)}</em>;
+      }
       if (part.startsWith("`") && part.endsWith("`")) {
-        return <code key={idx} className="bg-slate-100 px-1.5 py-0.5 rounded text-xs font-mono text-slate-800 border border-slate-200">{part.slice(1, -1)}</code>;
+        return <code key={idx} className="bg-slate-100 dark:bg-slate-800 px-1.5 py-0.5 rounded text-[11px] font-mono border border-slate-200 dark:border-slate-700">{part.slice(1, -1)}</code>;
       }
       if (part.startsWith("(Fonte:") && part.endsWith(")")) {
         return (
-          <span key={idx} className="inline-flex items-center gap-1 mx-1 px-1.5 py-0.5 bg-[var(--cor-primaria-clara)] border border-[var(--cor-borda-primaria)] rounded text-xs text-[var(--cor-primaria)] font-medium">
+          <span key={idx} className="inline-flex items-center gap-1 mx-1 px-1.5 py-0.5 bg-[var(--cor-primaria-clara)] border border-[var(--cor-borda-primaria)] rounded text-[11px] text-[var(--cor-primaria)] font-medium">
             <FileText className="w-3 h-3 text-[var(--cor-primaria)] inline flex-shrink-0" />
             {part}
           </span>
         );
       }
-      if (part === "[[SEM_INFORMACAO]]") {
+      if (part === "[[SEM_INFORMACAO]]" || part.trim() === "[[SEM_INFORMACAO]]") {
         return (
-          <span key={idx} className="inline-flex items-center gap-1 px-2 py-0.5 bg-[var(--cor-aviso-fundo)] border border-[#FFE0A3] rounded text-xs text-[var(--cor-aviso-texto)] font-semibold">
+          <span key={idx} className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-[var(--cor-aviso-fundo)] border border-[#FFE0A3] rounded text-xs text-[var(--cor-aviso-texto)] font-medium">
             <AlertCircle className="w-3.5 h-3.5 text-[var(--cor-aviso-texto)] inline flex-shrink-0" />
-            [[SEM_INFORMACAO]]
+            Não encontrei essa informação nos documentos selecionados.
           </span>
         );
       }
@@ -879,15 +1065,24 @@ export default function ChatPanel({
 
         {/* Fluxo de Mensagens */}
         <div className="flex-1 overflow-y-auto p-4 space-y-4 custom-scrollbar bg-[var(--cor-chat-fundo)] z-10 relative">
-          {messages.map((msg) => {
+          {messages.map((msg, idx) => {
             const isAssistant = msg.sender === "assistant";
+            const isWelcomeMsg =
+              isAssistant && (
+                msg.id === "welcome" ||
+                msg.id.startsWith("welcome") ||
+                idx === 0 ||
+                msg.text?.toLowerCase().includes("assistente de consultas") ||
+                msg.text?.toLowerCase().includes("robbi9") ||
+                msg.text?.toLowerCase().includes("especialista em rpa")
+              );
             
             return (
               <div key={msg.id} className={`flex ${isAssistant ? "justify-start" : "justify-end"} items-start gap-3 max-w-full`}>
                 {isAssistant && (
                   <div
                     className="relative flex-shrink-0 mt-0.5 animate-float select-none"
-                    title="robbi9 - Assistente de consultas da Biti9"
+                    title="Robbi9 - Assistente de consultas da Biti9"
                   >
                     <img
                       src="https://connect.biti9.com.br/mascote-robbi9.png"
@@ -937,17 +1132,22 @@ export default function ChatPanel({
                         ))}
                       </div>
                     )}
-                    {formatMarkdown(
-                      msg.id === "welcome"
-                        ? "Olá! Sou o **robbi9**, assistente de consultas da **biti9**.\n\nFui treinado para analisar os seus **Process Design Documents (PDDs)** e planilhas/documentos **T2R**.\n\nSeu histórico de conversas é 100% individual e privado, protegido e vinculado com exclusividade ao seu usuário corporativo.\n\nComo posso ajudar você hoje?"
-                        : (msg.text || "...")
+                    {isWelcomeMsg ? (
+                      formatMarkdown(WELCOME_FULL_TEXT)
+                    ) : msg.text ? (
+                      formatMarkdown(msg.text)
+                    ) : (
+                      <div className="flex items-center gap-2 py-1 text-[var(--cor-texto-secundario)]">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-[var(--cor-primaria)]" />
+                        <span className="text-xs">Consultando fontes e gerando resposta...</span>
+                      </div>
                     )}
                   </div>
 
                   {/* Metadados / Tags da Mensagem */}
                   <div className={`text-xs text-[var(--cor-texto-secundario)] flex items-center gap-1.5 ${isAssistant ? "justify-start pl-1" : "justify-end pr-1"}`}>
                     <span>{msg.timestamp}</span>
-                    {isAssistant && msg.id !== "welcome" && (
+                    {isAssistant && !isWelcomeMsg && (
                       msg.isError ? (
                         <span className="text-rose-600 flex items-center gap-0.5 text-xs font-medium">
                           <XCircle className="w-3.5 h-3.5" />
@@ -962,20 +1162,20 @@ export default function ChatPanel({
                           {msg.text && (
                             <button
                               type="button"
-                              onClick={() => handleSalvarPDF(msg)}
-                              disabled={salvandoPdfMsgId === msg.id}
-                              className="text-[var(--cor-primaria)] hover:text-slate-900 transition-colors flex items-center gap-1 text-xs bg-[var(--cor-primaria-clara)] hover:bg-slate-100 px-2 py-0.5 rounded border border-[var(--cor-borda-primaria)] cursor-pointer ml-auto disabled:opacity-50 font-medium"
-                              title="Salvar esta consulta em PDF no Firebase Storage e registrar no Firestore"
+                              onClick={() => handleBaixarPDF(msg)}
+                              disabled={baixandoPdfMsgId === msg.id}
+                              className="text-[var(--cor-texto-secundario)] hover:text-[var(--cor-primaria)] transition-colors flex items-center gap-1 text-[11px] hover:bg-[var(--cor-superficie)] px-1.5 py-0.5 rounded cursor-pointer ml-auto disabled:opacity-50 font-normal"
+                              title="Baixar como PDF"
                             >
-                              {salvandoPdfMsgId === msg.id ? (
+                              {baixandoPdfMsgId === msg.id ? (
                                 <>
-                                  <RefreshCw className="w-2.5 h-2.5 animate-spin text-[var(--cor-primaria)]" />
-                                  <span>Salvando PDF...</span>
+                                  <RefreshCw className="w-3 h-3 animate-spin text-[var(--cor-primaria)]" />
+                                  <span>Gerando PDF...</span>
                                 </>
                               ) : (
                                 <>
-                                  <Cloud className="w-2.5 h-2.5 text-[var(--cor-primaria)]" />
-                                  <span>Salvar PDF (Storage)</span>
+                                  <Download className="w-3 h-3 text-current" />
+                                  <span>Baixar como PDF</span>
                                 </>
                               )}
                             </button>
@@ -989,7 +1189,7 @@ export default function ChatPanel({
             );
           })}
 
-          {loading && !isTyping && (
+          {loading && !isTyping && messages[messages.length - 1]?.sender !== "assistant" && (
             <div className="flex items-start gap-3 max-w-xl">
               <div
                 className="relative flex-shrink-0 animate-float select-none"
@@ -1088,6 +1288,21 @@ export default function ChatPanel({
             </div>
           )}
 
+          {/* Mensagem de Erro de Anexo */}
+          {attachmentError && (
+            <div className="mb-2 flex items-center gap-2 p-2 rounded-lg bg-rose-500/10 border border-rose-500/20 text-rose-500 text-xs">
+              <AlertCircle className="w-3.5 h-3.5 flex-shrink-0" />
+              <span className="flex-1">{attachmentError}</span>
+              <button
+                type="button"
+                onClick={() => setAttachmentError(null)}
+                className="text-rose-400 hover:text-rose-600 text-xs font-bold"
+              >
+                ✕
+              </button>
+            </div>
+          )}
+
           {/* Formulário de Input */}
           <form
             onSubmit={(e) => {
@@ -1096,21 +1311,11 @@ export default function ChatPanel({
             }}
             className="relative flex items-center w-full"
           >
-            {/* Input de Arquivo Escondido */}
-            <input 
-              type="file" 
-              ref={fileInputRef} 
-              onChange={handleFileChange} 
-              accept=".png,.jpg,.jpeg,.pdf,.xlsx,.csv,.docx,.txt" 
-              multiple
-              className="hidden" 
-            />
-
             <input
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              placeholder="Pergunte algo sobre os robôs (ex: 'Quais robôs o Cliente X possui?')..."
+              placeholder="Pergunte algo sobre os robôs..."
               disabled={loading || isTyping}
               className="w-full bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-full py-2.5 pl-4 pr-12 text-xs text-[var(--cor-texto)] placeholder-[var(--cor-texto-secundario)] focus:outline-none focus:border-[var(--cor-primaria)] focus:bg-[var(--cor-card-fundo)] focus:ring-1 focus:ring-[var(--cor-primaria)]/20 transition-all disabled:opacity-50 font-sans"
             />

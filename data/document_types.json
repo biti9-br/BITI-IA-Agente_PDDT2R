@@ -1,0 +1,24 @@
+[
+  {
+    "id": "pdd",
+    "sigla": "PDD",
+    "nome": "Process Design Document",
+    "descricao": "Documento de Especificação de Design de Processo (PDD) para automação de processos RPA contendo mapeamento de regras, pré-requisitos, telas e volumetria.",
+    "promptValidacao": "Aja como especialista em RPA do Centro de Excelência que valida documentações de processos corporativos. Analise a estrutura do documento e valide se corresponde a um Process Definition Document (PDD) com especificações de automação.",
+    "secoesObrigatorias": [
+      "Cabeçalho com Cliente e Processo",
+      "Histórico de Revisões",
+      "Visão Geral",
+      "Pré-requisitos",
+      "Mapa do Processo",
+      "Matriz RACI",
+      "Passo a Passo",
+      "Exceções",
+      "Volumetria"
+    ],
+    "ativo": true,
+    "criadoPor": "sistema",
+    "atualizadoPor": "ana.lopes@biti9.com.br",
+    "atualizadoEm": "2026-09-28T14:49:50.285Z"
+  }
+]

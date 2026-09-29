@@ -161,7 +161,7 @@ export default function Sidebar({
           <Search className="absolute left-2.5 top-2.5 w-4 h-4 text-[var(--cor-texto-secundario)]" />
           <input
             type="text"
-            placeholder="Buscar PDD ou robô..."
+            placeholder="Buscar documento ou robô..."
             value={searchQuery}
             onChange={(e) => setSearchQuery(e.target.value)}
             className="w-full bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-lg py-2 pl-9 pr-4 text-xs text-[var(--cor-texto)] placeholder-[var(--cor-texto-secundario)] focus:outline-none focus:border-[var(--cor-primaria)] focus:bg-[var(--cor-card-fundo)] transition-colors"
@@ -262,6 +262,30 @@ export default function Sidebar({
                                 >
                                   <FileText className="w-3 h-3 text-[var(--cor-texto-secundario)] flex-shrink-0" />
                                   <span className="truncate flex-1">{doc.name}</span>
+                                  {doc.tipoDocumento && (
+                                    <span
+                                      className="text-[8px] font-mono font-semibold px-1 rounded bg-sky-500/10 text-sky-600 dark:text-sky-400 border border-sky-500/20 flex-shrink-0"
+                                      title={`Tipo de documento: ${doc.tipoDocumento}`}
+                                    >
+                                      {doc.tipoDocumento}
+                                    </span>
+                                  )}
+                                  {(!doc.formatoConteudo || doc.formatoConteudo !== "markdown") && (
+                                    <span
+                                      className="text-[8px] font-medium px-1 rounded bg-amber-500/15 text-amber-700 dark:text-amber-400 border border-amber-500/30 flex-shrink-0"
+                                      title="Formato antigo – reimporte para melhor qualidade"
+                                    >
+                                      Antigo
+                                    </span>
+                                  )}
+                                  {doc.checksum && (
+                                    <span
+                                      className="text-[8px] font-mono text-[var(--cor-texto-secundario)] bg-[var(--cor-hover)] px-1 rounded border border-[var(--cor-borda)] cursor-help flex-shrink-0"
+                                      title={`SHA-256: ${doc.checksum}`}
+                                    >
+                                      #{doc.checksum.slice(0, 8)}
+                                    </span>
+                                  )}
                                   {doc.chunkCount && (
                                     <span className="text-[9px] text-[var(--cor-primaria)] bg-[var(--cor-primaria-clara)] border border-[var(--cor-borda-primaria)] px-1 rounded font-medium">
                                       {doc.chunkCount}f

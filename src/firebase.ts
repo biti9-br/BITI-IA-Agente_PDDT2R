@@ -1,7 +1,5 @@
 import { initializeApp, getApps, getApp } from "firebase/app";
-import { getAuth } from "firebase/auth";
-import { getFirestore } from "firebase/firestore";
-import { getStorage } from "firebase/storage";
+import { getAuth, browserLocalPersistence, setPersistence } from "firebase/auth";
 import appletConfig from "../firebase-applet-config.json";
 
 const firebaseConfig = {
@@ -15,6 +13,10 @@ const firebaseConfig = {
 
 const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApp();
 export const auth = getAuth(app);
-export const db = getFirestore(app);
-export const storage = getStorage(app);
+
+// Persistência local padrão do Firebase Auth (para a sessão sobreviver ao F5 / recarregamento)
+setPersistence(auth, browserLocalPersistence).catch((err) => {
+  console.warn("[Firebase Auth] Aviso ao configurar browserLocalPersistence:", err);
+});
+
 export default app;

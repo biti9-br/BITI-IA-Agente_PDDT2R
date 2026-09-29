@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Folder, RefreshCw, AlertTriangle, Play, Terminal, X, ShieldAlert, CheckCircle2 } from "lucide-react";
+import { apiFetch } from "../services/api";
 
 interface SyncModalProps {
   isOpen: boolean;
@@ -96,11 +97,11 @@ export default function SyncModal({
       // Step 2: Trigger the RAG Sync backend
       setLogs(prev => [...prev, `[SISTEMA] Disparando indexação neural no backend (PDFs e T2Rs)...`]);
       
-      const res = await fetch("/api/drive/sync-real", {
+      const res = await apiFetch("/api/drive/sync-real", {
         method: "POST",
         headers: {
           "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`
+          ...(token ? { "x-drive-token": token } : {})
         },
         body: JSON.stringify({
           rootFolderId: folderId,

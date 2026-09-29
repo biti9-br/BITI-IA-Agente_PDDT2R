@@ -3,89 +3,100 @@ import {
   observarUsuario,
   logout as authLogout,
   verificarResultadoRedirect,
+  extrairEmailUsuario,
+  obterMotivoLogout,
 } from "../auth";
+import { auth } from "../firebase";
 import { garantirUsuario } from "../services/usuarios";
 import type { User as FirebaseUser } from "firebase/auth";
-import type { CorporateUser } from "../auth";
 
-export type AppUser = FirebaseUser | CorporateUser;
+export type AppUser = FirebaseUser;
 
 export function useAuth() {
   const [usuario, setUsuario] = useState<AppUser | null>(null);
   const [carregandoAuth, setCarregandoAuth] = useState(true);
+  const [userEmail, setUserEmail] = useState<string>("");
   const [authError, setAuthError] = useState<string | null>(null);
 
   useEffect(() => {
     let montado = true;
 
-    // 1. Checa resultado de redirect (Microsoft / Provedor)
-    verificarResultadoRedirect()
-      .then(async (result) => {
+    async function inicializarAutenticacao() {
+      // 4. AGUARDAR O FIREBASE:
+      // Antes de qualquer verificação de sessão ou chamada à API, aguarde await auth.authStateReady().
+      // Não trate currentUser null como logout enquanto o Firebase ainda carrega.
+      if (typeof auth.authStateReady === "function") {
+        await auth.authStateReady();
+      }
+
+      // Checa resultado de redirect se houver
+      verificarResultadoRedirect().catch((err) => {
+        console.warn("Aviso no redirect de autenticação:", err);
+      });
+
+      // Observador do Firebase Auth
+      const unsubscribe = observarUsuario(async (fbUser) => {
         if (!montado) return;
-        if (result?.user) {
-          const userEmail = result.user.email?.toLowerCase().trim() || "";
-          if (!userEmail.endsWith("@biti9.com.br")) {
-            await authLogout();
+
+        if (fbUser) {
+          // 2. E-MAIL: Obtenha o e-mail na ordem definida (user.email -> providerData[0].email -> claim email -> preferred_username)
+          const emailResolvido = await extrairEmailUsuario(fbUser);
+
+          // 3. NÃO DESLOGAR POR ERRO DE API
+          // Único motivo para signOut() automático: e-mail fora do domínio @biti9.com.br
+          if (!emailResolvido.endsWith("@biti9.com.br")) {
+            const motivo = `Sessão encerrada: e-mail fora do domínio permitido (${emailResolvido || "não informado"})`;
+            console.warn(`[useAuth] ${motivo}`);
+            await authLogout(motivo);
             if (montado) {
-              setAuthError(`Acesso negado: O e-mail "${userEmail}" não pertence ao domínio corporativo @biti9.com.br.`);
+              setAuthError(motivo);
               setUsuario(null);
+              setUserEmail("");
               setCarregandoAuth(false);
             }
             return;
           }
+
           if (montado) {
-            setUsuario(result.user);
+            setUsuario(fbUser);
+            setUserEmail(emailResolvido);
+            setAuthError(null);
+            setCarregandoAuth(false);
           }
-          await garantirUsuario(result.user);
-        }
-      })
-      .catch((err) => {
-        console.error("Erro no redirect de autenticação:", err);
-        if (montado) {
-          setAuthError(err.code || err.message);
+
+          await garantirUsuario(fbUser, emailResolvido);
+        } else {
+          if (montado) {
+            setUsuario(null);
+            setUserEmail("");
+            const motivoRegistrado = obterMotivoLogout();
+            if (motivoRegistrado) {
+              setAuthError(motivoRegistrado);
+            }
+            setCarregandoAuth(false);
+          }
         }
       });
 
-    // 2. Observador oficial do Firebase Auth
-    const unsubscribe = observarUsuario(async (user) => {
-      if (!montado) return;
-      if (user) {
-        const userEmail = user.email?.toLowerCase().trim() || "";
-        if (userEmail && !userEmail.endsWith("@biti9.com.br")) {
-          await authLogout();
-          if (montado) {
-            setAuthError("Acesso restrito: Apenas colaboradores da BITI9 (@biti9.com.br) têm autorização para acessar.");
-            setUsuario(null);
-            setCarregandoAuth(false);
-          }
-          return;
-        }
-        if (montado) {
-          setUsuario(user);
-        }
-        await garantirUsuario(user);
-      } else {
-        if (montado) {
-          setUsuario(null);
-        }
-      }
-      if (montado) {
-        setCarregandoAuth(false);
-      }
+      return unsubscribe;
+    }
+
+    let unsub: (() => void) | undefined;
+    inicializarAutenticacao().then((fn) => {
+      unsub = fn;
     });
 
     return () => {
       montado = false;
-      unsubscribe();
+      if (unsub) unsub();
     };
   }, []);
 
-  const logout = async () => {
-    await authLogout();
+  const logout = async (motivo?: string) => {
+    await authLogout(motivo);
     setUsuario(null);
+    setUserEmail("");
   };
-
-  const userEmail = usuario?.email || "";
 
   return {
     usuario,

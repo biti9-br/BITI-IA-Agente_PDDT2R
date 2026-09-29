@@ -1,16 +1,5 @@
-import { 
-  collection, 
-  doc, 
-  setDoc, 
-  getDocs, 
-  deleteDoc, 
-  updateDoc, 
-  query, 
-  orderBy, 
-  serverTimestamp 
-} from "firebase/firestore";
-import { db, auth } from "../firebase";
-import { ChatSession, ChatMessage } from "../types";
+import { apiFetch } from "./api";
+import { ChatSession } from "../types";
 
 export interface MensagemItem {
   role: string;
@@ -25,115 +14,64 @@ export interface ConversaDoc {
   atualizadoEm?: any;
 }
 
-// Helper para remover campos `undefined` que o Firestore rejeita
-function sanitizeForFirestore<T>(data: T): T {
-  return JSON.parse(JSON.stringify(data));
-}
-
 /**
- * Salva ou atualiza uma sessão completa de conversa no Firestore para o usuário específico.
- * Caminho: users/{uid}/conversas/{sessaoId}
- * Garantia de privacidade e isolamento total por usuário.
+ * Salva ou atualiza uma sessão completa de conversa via API do servidor.
  */
 export async function salvarSessaoFirestore(uid: string, sessao: ChatSession): Promise<void> {
-  if (!uid || !sessao?.id) return;
-  // Só sincroniza diretamente se houver sessão ativa do Firebase Auth compatível
-  if (!auth.currentUser || auth.currentUser.uid !== uid) return;
-
+  if (!sessao?.id) return;
   try {
-    const docRef = doc(db, "users", uid, "conversas", sessao.id);
-    const cleanSession = sanitizeForFirestore({
-      id: sessao.id,
-      title: sessao.title || "Nova Conversa",
-      messages: sessao.messages || [],
-      // Array de mensagens padronizado para o gatilho automático da Cloud Function (indexarMensagensNovas)
-      mensagens: (sessao.messages || []).map(m => ({
-        role: m.sender === "user" ? "user" : "assistant",
-        content: m.text || ""
-      })),
-      timestamp: sessao.timestamp || new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      atualizadoEm: serverTimestamp()
+    await apiFetch("/api/conversations", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(sessao)
     });
-
-    await setDoc(docRef, cleanSession, { merge: true });
   } catch (err) {
-    console.error(`Erro ao salvar sessão ${sessao.id} no Firestore para o usuário ${uid}:`, err);
+    console.error(`Erro ao salvar sessão ${sessao.id} via API:`, err);
   }
 }
 
 /**
- * Carrega todas as sessões privadas do usuário específico a partir do Firestore.
- * Caminho: users/{uid}/conversas
+ * Carrega todas as sessões privadas do usuário específico via API do servidor.
  */
 export async function carregarSessoesFirestore(uid: string): Promise<ChatSession[]> {
-  if (!uid) return [];
-  // Só busca diretamente se houver sessão ativa do Firebase Auth compatível
-  if (!auth.currentUser || auth.currentUser.uid !== uid) return [];
-
   try {
-    const colRef = collection(db, "users", uid, "conversas");
-    // Tenta ordenar por atualizadoEm decrescente
-    let snapshot;
-    try {
-      const q = query(colRef, orderBy("atualizadoEm", "desc"));
-      snapshot = await getDocs(q);
-    } catch {
-      // Fallback sem ordenação caso índice ainda esteja sendo construído
-      snapshot = await getDocs(colRef);
-    }
-
-    if (snapshot.empty) return [];
-
-    const sessoes: ChatSession[] = [];
-    snapshot.forEach((d) => {
-      const data = d.data();
-      sessoes.push({
-        id: data.id || d.id,
-        title: data.title || "Conversa",
-        messages: Array.isArray(data.messages) ? data.messages : [],
-        timestamp: data.timestamp || "",
-        criadoEm: data.criadoEm,
-        atualizadoEm: data.atualizadoEm
-      });
-    });
-
-    return sessoes;
+    const res = await apiFetch("/api/conversations");
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.sessions) ? data.sessions : [];
   } catch (err) {
-    console.warn(`Aviso ao carregar sessões do usuário ${uid} no Firestore:`, err);
+    console.warn("Aviso ao carregar sessões via API:", err);
     return [];
   }
 }
 
 /**
- * Remove uma sessão privada do usuário específico no Firestore.
+ * Remove uma sessão privada do usuário específico via API do servidor.
  */
 export async function excluirSessaoFirestore(uid: string, sessaoId: string): Promise<void> {
-  if (!uid || !sessaoId) return;
-  if (!auth.currentUser || auth.currentUser.uid !== uid) return;
-
+  if (!sessaoId) return;
   try {
-    const docRef = doc(db, "users", uid, "conversas", sessaoId);
-    await deleteDoc(docRef);
+    await apiFetch(`/api/conversations/${sessaoId}`, {
+      method: "DELETE"
+    });
   } catch (err) {
-    console.error(`Erro ao excluir sessão ${sessaoId} no Firestore para o usuário ${uid}:`, err);
+    console.error(`Erro ao excluir sessão ${sessaoId} via API:`, err);
   }
 }
 
 /**
- * Renomeia o título de uma sessão privada do usuário específico no Firestore.
+ * Renomeia o título de uma sessão privada do usuário específico via API do servidor.
  */
 export async function renomearSessaoFirestore(uid: string, sessaoId: string, novoTitulo: string): Promise<void> {
-  if (!uid || !sessaoId) return;
-  if (!auth.currentUser || auth.currentUser.uid !== uid) return;
-
+  if (!sessaoId) return;
   try {
-    const docRef = doc(db, "users", uid, "conversas", sessaoId);
-    await updateDoc(docRef, {
-      title: novoTitulo,
-      atualizadoEm: serverTimestamp()
+    await apiFetch(`/api/conversations/${sessaoId}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ title: novoTitulo })
     });
   } catch (err) {
-    console.error(`Erro ao renomear sessão ${sessaoId} no Firestore:`, err);
+    console.error(`Erro ao renomear sessão ${sessaoId} via API:`, err);
   }
 }
 
@@ -142,34 +80,31 @@ export async function salvarConversa(
   uid: string,
   mensagens: { role: string; content: string }[]
 ) {
-  if (!uid) return null;
-  try {
-    const ref = collection(db, "users", uid, "conversas");
-    const docRef = doc(ref);
-    await setDoc(docRef, {
-      mensagens,
-      criadoEm: serverTimestamp(),
-      atualizadoEm: serverTimestamp(),
-    });
-    return docRef.id;
-  } catch (err) {
-    console.error("Erro ao salvar conversa legada no Firestore:", err);
-    return null;
-  }
+  const sessId = `conv_${Date.now()}`;
+  await salvarSessaoFirestore(uid, {
+    id: sessId,
+    title: "Conversa",
+    messages: mensagens.map((m, i) => ({
+      id: `msg_${i}`,
+      sender: (m.role === "user" ? "user" : "assistant") as "user" | "assistant",
+      text: m.content,
+      timestamp: new Date().toISOString()
+    })),
+    timestamp: new Date().toLocaleTimeString()
+  });
+  return sessId;
 }
 
 export async function carregarConversas(uid: string): Promise<ConversaDoc[]> {
-  if (!uid) return [];
-  try {
-    const ref = collection(db, "users", uid, "conversas");
-    const q = query(ref, orderBy("criadoEm", "desc"));
-    const snapshot = await getDocs(q);
-    return snapshot.docs.map((d) => ({
-      id: d.id,
-      ...d.data(),
-    })) as ConversaDoc[];
-  } catch (err) {
-    console.warn("Aviso ao carregar conversas do Firestore:", err);
-    return [];
-  }
+  const sessions = await carregarSessoesFirestore(uid);
+  return sessions.map(s => ({
+    id: s.id,
+    mensagens: (s.messages || []).map(m => ({
+      role: m.sender === "user" ? "user" : "assistant",
+      content: m.text
+    })),
+    criadoEm: s.criadoEm,
+    atualizadoEm: s.atualizadoEm
+  }));
 }
+

@@ -14,16 +14,21 @@ import {
   CheckCircle,
   XCircle,
   AlertCircle,
+  AlertTriangle,
   Folder,
   Cloud,
   ChevronDown,
   X,
   Check,
   Building2,
-  ExternalLink
+  ExternalLink,
+  Eye
 } from "lucide-react";
 import { ClientGroup, PDDDocument } from "../types";
 import SharePointBrowserModal from "./SharePointBrowserModal";
+import ExtractedContentModal from "./ExtractedContentModal";
+import { apiFetch } from "../services/api";
+import { auth } from "../firebase";
 
 interface SourcesPanelProps {
   clientGroups: ClientGroup[];
@@ -48,19 +53,25 @@ export default function SourcesPanel({
 }: SourcesPanelProps) {
   const [uploading, setUploading] = useState(false);
   const [dragActive, setDragActive] = useState(false);
-  const [uploadStatus, setUploadStatus] = useState<{ message: string; type: "success" | "error" | null }>({
+  const [uploadStatus, setUploadStatus] = useState<{ message: string; type: "success" | "error" | "warning" | null }>({
     message: "",
     type: null
   });
   const [uploadProgress, setUploadProgress] = useState<{
     percent: number;
     statusText: string;
-    files: { [fileName: string]: { progress: number; status: "pending" | "uploading" | "success" | "error"; attempt?: number; error?: string } };
+    files: { [fileName: string]: { progress: number; status: "pending" | "uploading" | "success" | "error" | "warning"; attempt?: number; error?: string } };
   }>({
     percent: 0,
     statusText: "",
     files: {}
   });
+  const [versionConflict, setVersionConflict] = useState<{
+    file: File;
+    metadata?: { origin?: string; folderPath?: string; action?: "replace" | "keep_both" };
+    existingFileName: string;
+    message?: string;
+  } | null>(null);
   const [localDeletedFileIds, setLocalDeletedFileIds] = useState<string[]>([]);
   const [searchQuery, setSearchQuery] = useState("");
   const [visibleLimit, setVisibleLimit] = useState(50);
@@ -69,9 +80,25 @@ export default function SourcesPanel({
   // Estados para Menu de Origem e Modal SharePoint
   const [addMenuOpen, setAddMenuOpen] = useState(false);
   const [showSharePointBrowser, setShowSharePointBrowser] = useState(false);
+  const [activeSiglas, setActiveSiglas] = useState<string[]>([]);
+  const [loadingTypes, setLoadingTypes] = useState(true);
+  const [previewFile, setPreviewFile] = useState<PDDDocument | null>(null);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
   const addMenuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setLoadingTypes(true);
+    apiFetch("/api/settings/document-types/active")
+      .then(res => res.json())
+      .then(data => {
+        if (Array.isArray(data.siglas) && data.siglas.length > 0) {
+          setActiveSiglas(data.siglas);
+        }
+      })
+      .catch(() => {})
+      .finally(() => setLoadingTypes(false));
+  }, []);
 
   // Fechar menu de adicionar ao clicar fora
   useEffect(() => {
@@ -132,130 +159,76 @@ export default function SourcesPanel({
     return <File className="w-4 h-4 text-slate-400 flex-shrink-0" />;
   };
 
-  const handleImportSharePointFile = async (blob: Blob, fileName: string, folderPath: string) => {
-    setUploading(true);
-    setUploadStatus({ message: "", type: null });
-
-    const initialFilesState = {
-      [fileName]: { progress: 10, status: "uploading" as const, attempt: 1 }
-    };
-
-    setUploadProgress({
-      percent: 15,
-      statusText: `Baixando e preparando "${fileName}" do SharePoint...`,
-      files: initialFilesState
-    });
-
-    try {
-      const base64 = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const resStr = (reader.result as string).split(",")[1];
-          resolve(resStr);
-        };
-        reader.onerror = () => reject(new Error("Erro ao ler os dados binários do SharePoint."));
-        reader.readAsDataURL(blob);
-      });
-
-      setUploadProgress(prev => ({
-        percent: 60,
-        statusText: `Validando PDD e calculando embeddings para "${fileName}"...`,
-        files: {
-          [fileName]: { progress: 60, status: "uploading", attempt: 1 }
-        }
-      }));
-
-      const res = await fetch("/api/db/add-source", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          name: fileName,
-          type: blob.type || "application/octet-stream",
-          base64,
-          userEmail,
-          conversationId: activeSessionId,
-          origin: "SharePoint",
-          folderPath,
-          originalName: fileName
-        })
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({}));
-        let msg = data.erro || data.error || "Erro ao processar o arquivo do SharePoint.";
-        if (data.justificativa) {
-          msg = `${msg} ${data.justificativa}`;
-        }
-        throw new Error(msg);
-      }
-
-      setUploadProgress(prev => ({
-        percent: 100,
-        statusText: `"${fileName}" indexado com sucesso a partir do SharePoint!`,
-        files: {
-          [fileName]: { progress: 100, status: "success", attempt: 1 }
-        }
-      }));
-
-      setUploadStatus({
-        message: `Documento "${fileName}" importado do SharePoint e indexado com sucesso!`,
-        type: "success"
-      });
-
-      onRefresh();
-    } catch (err: any) {
-      console.error("Erro na importação do SharePoint:", err);
-      setUploadProgress(prev => ({
-        percent: 100,
-        statusText: `Falha ao indexar "${fileName}".`,
-        files: {
-          [fileName]: { progress: 100, status: "error", attempt: 1, error: err.message }
-        }
-      }));
-      setUploadStatus({
-        message: `Erro ao importar do SharePoint: ${err.message}`,
-        type: "error"
-      });
-      throw err;
-    } finally {
-      setUploading(false);
-    }
+  const handleImportSharePointFile = async (file: File, folderPath: string) => {
+    // Entrega o arquivo em memória direto ao mesmo fluxo de processamento usado pelo upload local:
+    await handleUploadFiles([file], { origin: "SharePoint", folderPath });
   };
 
   const readFileAsBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
+      if (!file || !(file instanceof Blob) || file.size === 0) {
+        return reject(new Error("Selecione o arquivo novamente."));
+      }
       const reader = new FileReader();
       reader.onload = () => {
-        const base64 = (reader.result as string).split(',')[1];
+        const result = reader.result as string;
+        if (!result) {
+          return reject(new Error("Selecione o arquivo novamente."));
+        }
+        const base64 = result.split(',')[1];
+        if (!base64) {
+          return reject(new Error("Selecione o arquivo novamente."));
+        }
         resolve(base64);
       };
-      reader.onerror = () => reject(new Error("Erro ao ler o arquivo local."));
-      reader.readAsDataURL(file);
+      reader.onerror = () => reject(new Error("Selecione o arquivo novamente."));
+      try {
+        reader.readAsDataURL(file);
+      } catch {
+        reject(new Error("Selecione o arquivo novamente."));
+      }
     });
   };
 
-  const handleUploadFiles = async (fileList: FileList | File[]) => {
+  const handleResolveVersionConflict = async (action: "replace" | "keep_both") => {
+    if (!versionConflict) return;
+    const target = { ...versionConflict };
+    setVersionConflict(null);
+    await handleUploadFiles([target.file], {
+      ...target.metadata,
+      action
+    });
+  };
+
+  const handleUploadFiles = async (
+    fileList: FileList | File[],
+    metadata?: { origin?: string; folderPath?: string; action?: "replace" | "keep_both" }
+  ) => {
     const filesArray = Array.from(fileList);
     if (filesArray.length === 0) return;
 
     setUploading(true);
     setUploadStatus({ message: "", type: null });
 
-    const initialFilesState: { [fileName: string]: { progress: number; status: "pending" | "uploading" | "success" | "error"; attempt?: number; error?: string } } = {};
+    const initialFilesState: { [fileName: string]: { progress: number; status: "pending" | "uploading" | "success" | "error" | "warning"; attempt?: number; error?: string } } = {};
     filesArray.forEach(file => {
       initialFilesState[file.name] = { progress: 0, status: "pending", attempt: 1 };
     });
 
+    const isSharePoint = metadata?.origin === "SharePoint";
+
     setUploadProgress({
       percent: 0,
-      statusText: `Preparando ${filesArray.length} arquivo(s) para indexação...`,
+      statusText: isSharePoint
+        ? `Indexando "${filesArray[0]?.name}" do SharePoint (${metadata?.folderPath || "Projetos"})...`
+        : `Preparando ${filesArray.length} arquivo(s) para indexação...`,
       files: initialFilesState
     });
 
     const updateFileProgress = (
       fileName: string,
       progress: number,
-      status: "pending" | "uploading" | "success" | "error",
+      status: "pending" | "uploading" | "success" | "error" | "warning",
       attempt: number = 1,
       errorMsg?: string
     ) => {
@@ -268,7 +241,7 @@ export default function SourcesPanel({
         const sum = keys.reduce((acc, name) => acc + (nextFiles[name]?.progress || 0), 0);
         const avgPercent = Math.round(sum / keys.length);
 
-        const completed = keys.filter(name => nextFiles[name]?.status === "success" || nextFiles[name]?.status === "error").length;
+        const completed = keys.filter(name => nextFiles[name]?.status === "success" || nextFiles[name]?.status === "error" || nextFiles[name]?.status === "warning").length;
         const statusText = completed === keys.length 
           ? "Indexação de lote finalizada" 
           : `Indexando arquivo ${completed + 1} de ${keys.length}...`;
@@ -282,8 +255,15 @@ export default function SourcesPanel({
     };
 
     const uploadSingleFileWithRetry = async (file: File) => {
+      if (!file || !(file instanceof Blob) || file.size === 0) {
+        updateFileProgress(file?.name || "Arquivo", 100, "error", 1, "Selecione o arquivo novamente.");
+        const missingErr = new Error("Selecione o arquivo novamente.");
+        (missingErr as any).isMissingContent = true;
+        throw missingErr;
+      }
+
       const ext = '.' + file.name.split('.').pop()?.toLowerCase();
-      const validExtensions = ['.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.csv', '.docx', '.txt'];
+      const validExtensions = ['.png', '.jpg', '.jpeg', '.pdf', '.xlsx', '.xls', '.docx', '.doc', '.csv', '.txt'];
 
       if (!validExtensions.includes(ext) && !file.type.startsWith("image/")) {
         updateFileProgress(file.name, 100, "error", 1, `Formato "${ext}" não suportado.`);
@@ -310,22 +290,47 @@ export default function SourcesPanel({
         try {
           const base64 = await readFileAsBase64(file);
           
-          const res = await fetch("/api/db/add-source", {
+          const res = await apiFetch("/api/db/add-source", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
               name: file.name,
               type: file.type || 'application/octet-stream',
               base64,
-              userEmail,
-              conversationId: activeSessionId
+              conversationId: activeSessionId,
+              origin: metadata?.origin || "Upload Direto",
+              folderPath: metadata?.folderPath || "",
+              originalName: file.name,
+              action: metadata?.action
             })
           });
 
           clearInterval(interval);
 
+          const data = await res.json().catch(() => ({}));
+
+          if (res.status === 409) {
+            if (data.code === "NEW_VERSION") {
+              setVersionConflict({
+                file,
+                metadata,
+                existingFileName: data.existingFileName || file.name,
+                message: data.message
+              });
+              updateFileProgress(file.name, 100, "warning", attempt, "Nova versão detectada. Aguardando decisão.");
+              return { type: "new_version", name: file.name };
+            }
+
+            // Regra a: duplicidade na mesma conversa
+            const warnMsg = data.message || `Este documento já foi importado nesta conversa.`;
+            updateFileProgress(file.name, 100, "warning", attempt, warnMsg);
+            const warnObj = new Error(warnMsg);
+            (warnObj as any).isWarning = true;
+            (warnObj as any).code = data.code || "ALREADY_EXISTS_SAME_CONVERSATION";
+            throw warnObj;
+          }
+
           if (!res.ok) {
-            const data = await res.json().catch(() => ({}));
             let msg = data.erro || data.error || "Erro ao processar o arquivo.";
             if (data.justificativa) {
               msg = `${msg} ${data.justificativa}`;
@@ -337,15 +342,24 @@ export default function SourcesPanel({
             throw errObj;
           }
 
+          if (data.reused) {
+            updateFileProgress(file.name, 100, "success", attempt, data.message);
+            return { type: "reused", name: file.name, message: data.message };
+          }
+
           updateFileProgress(file.name, 100, "success", attempt);
-          return file.name;
+          return { type: "success", name: file.name };
         } catch (err: any) {
           clearInterval(interval);
           const errorMsg = err.message || "Falha na indexação.";
           lastError = err;
           
-          if (err.isValidationError || attempt >= MAX_RETRIES) {
-            updateFileProgress(file.name, 100, "error", attempt, errorMsg);
+          if (err.isWarning || err.isValidationError || err.isMissingContent || err.message === "Selecione o arquivo novamente." || attempt >= MAX_RETRIES) {
+            if (err.isWarning) {
+              updateFileProgress(file.name, 100, "warning", attempt, errorMsg);
+            } else {
+              updateFileProgress(file.name, 100, "error", attempt, errorMsg);
+            }
             break;
           } else {
             const delay = attempt * 1200; // exponential/progressive backoff
@@ -366,7 +380,7 @@ export default function SourcesPanel({
 
     // CONTROLE DE CONCORRÊNCIA: Fila de processamento concorrente limitado a no máximo 3 uploads paralelos
     const CONCURRENCY = 3;
-    const results: { status: "fulfilled" | "rejected"; value?: string; reason?: any }[] = Array(filesArray.length);
+    const results: { status: "fulfilled" | "rejected"; value?: any; reason?: any }[] = Array(filesArray.length);
     let nextIndex = 0;
 
     const runWorker = async () => {
@@ -389,42 +403,70 @@ export default function SourcesPanel({
 
     await Promise.all(activeWorkers);
 
-    const succeeded = results.filter(r => r.status === "fulfilled").length;
-    const failed = results.filter(r => r.status === "rejected").length;
+    const succeeded = results.filter(r => r.status === "fulfilled" && (r.value as any)?.type === "success").length;
+    const reusedItems = results.filter(r => r.status === "fulfilled" && (r.value as any)?.type === "reused");
+    const newVersions = results.filter(r => r.status === "fulfilled" && (r.value as any)?.type === "new_version");
+    const warnings = results.filter(r => r.status === "rejected" && r.reason?.isWarning);
+    const hardFails = results.filter(r => r.status === "rejected" && !r.reason?.isWarning);
     const errors = results
-      .filter(r => r.status === "rejected")
+      .filter(r => r.status === "rejected" && !r.reason?.isWarning)
       .map(r => r.reason?.message || "Erro desconhecido");
     const lastErrorMessage = errors[errors.length - 1] || "";
 
     const failedFileList: File[] = [];
     results.forEach((r, idx) => {
-      if (r.status === "rejected") {
+      if (r.status === "rejected" && !r.reason?.isWarning) {
         failedFileList.push(filesArray[idx]);
       }
     });
     setFailedFiles(failedFileList);
 
-    if (succeeded > 0 && failed === 0) {
+    let returnResult = { success: true, warning: undefined as string | undefined, error: undefined as string | undefined };
+
+    if (newVersions.length > 0) {
+      returnResult = { success: true, warning: undefined, error: undefined };
+    } else if (reusedItems.length > 0 && hardFails.length === 0 && warnings.length === 0) {
+      const msg = (reusedItems[0].value as any)?.message || "Documento já processado anteriormente. Reaproveitado sem novo processamento.";
       setUploadStatus({
-        message: succeeded === 1 
+        message: msg,
+        type: "warning"
+      });
+      returnResult = { success: true, warning: msg, error: undefined };
+    } else if (warnings.length > 0 && hardFails.length === 0) {
+      const warnMsg = warnings[0].reason?.message || "Documento já importado nesta conversa.";
+      setUploadStatus({
+        message: warnMsg,
+        type: "warning"
+      });
+      returnResult = { success: false, warning: warnMsg, error: undefined };
+    } else if (succeeded > 0 && hardFails.length === 0) {
+      setUploadStatus({
+        message: metadata?.origin === "SharePoint"
+          ? `Documento "${filesArray[0].name}" importado do SharePoint e carregado com sucesso!`
+          : succeeded === 1 
           ? `"${filesArray[0].name}" indexado com sucesso!` 
           : `${succeeded} fontes de consulta indexadas com sucesso!`,
         type: "success"
       });
-    } else if (succeeded > 0 && failed > 0) {
+      returnResult = { success: true, warning: undefined, error: undefined };
+    } else if (succeeded > 0 && hardFails.length > 0) {
       setUploadStatus({
-        message: `${succeeded} indexados com sucesso, ${failed} falharam.`,
-        type: "success"
+        message: `${succeeded} indexados com sucesso, ${hardFails.length} falharam.`,
+        type: "warning"
       });
-    } else {
+      returnResult = { success: true, warning: `${succeeded} indexados com sucesso, ${hardFails.length} falharam.`, error: undefined };
+    } else if (hardFails.length > 0) {
+      const errorMsg = `Falha ao indexar arquivos. Erro: ${lastErrorMessage || "Formatos de arquivos não suportados"}`;
       setUploadStatus({
-        message: `Falha ao indexar arquivos. Erro: ${lastErrorMessage || "Formatos de arquivos não suportados"}`,
+        message: errorMsg,
         type: "error"
       });
+      returnResult = { success: false, warning: undefined, error: errorMsg };
     }
 
     setUploading(false);
     onRefresh();
+    return returnResult;
   };
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -446,10 +488,10 @@ export default function SourcesPanel({
     setLocalDeletedFileIds(prev => [...prev, fileId]);
 
     try {
-      const res = await fetch("/api/db/delete-source", {
+      const res = await apiFetch("/api/db/delete-source", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ fileId, userEmail, conversationId: activeSessionId })
+        body: JSON.stringify({ fileId, conversationId: activeSessionId })
       });
 
       if (res.ok) {
@@ -510,7 +552,7 @@ export default function SourcesPanel({
           ref={fileInputRef}
           onChange={handleFileChange}
           multiple
-          accept="image/*, application/pdf, .xlsx, .docx, .txt"
+          accept=".pdf,.docx,.doc,.xlsx,.xls,.csv,.txt,image/*"
           className="hidden" 
         />
         
@@ -602,7 +644,9 @@ export default function SourcesPanel({
           onClick={() => fileInputRef.current?.click()}
         >
           <span className="text-[10px] font-sans block leading-relaxed">
-            Arraste PDF, XLSX, Word ou pasta sincronizada aqui
+            {loadingTypes
+              ? "Carregando tipos permitidos..."
+              : `Arraste arquivos dos tipos permitidos (${activeSiglas.join(", ")}) aqui`}
           </span>
         </div>
 
@@ -629,10 +673,14 @@ export default function SourcesPanel({
           <div className={`p-2 rounded text-[10px] flex items-start gap-1.5 leading-snug border ${
             uploadStatus.type === "success" 
               ? "bg-emerald-950/20 border-emerald-500/20 text-emerald-400" 
+              : uploadStatus.type === "warning"
+              ? "bg-amber-500/10 border-amber-500/25 text-amber-500 dark:text-amber-400"
               : "bg-rose-950/20 border-rose-500/20 text-rose-400"
           }`}>
             {uploadStatus.type === "success" ? (
               <CheckCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-emerald-400 animate-bounce" />
+            ) : uploadStatus.type === "warning" ? (
+              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5 text-amber-500" />
             ) : (
               <XCircle className="w-3.5 h-3.5 flex-shrink-0 mt-0.5" />
             )}
@@ -641,7 +689,7 @@ export default function SourcesPanel({
             </div>
             <button 
               onClick={() => setUploadStatus({ message: "", type: null })}
-              className="text-slate-500 hover:text-slate-300 ml-1 font-mono text-[9px]"
+              className="text-slate-500 hover:text-slate-300 ml-1 font-mono text-[9px] cursor-pointer"
             >
               ✕
             </button>
@@ -659,7 +707,26 @@ export default function SourcesPanel({
               </div>
             </div>
             <button
-              onClick={() => handleUploadFiles(failedFiles)}
+              onClick={async () => {
+                const arquivosComConteudo = failedFiles.filter(f => f && f instanceof Blob && f.size > 0);
+                if (arquivosComConteudo.length === 0) {
+                  setUploadStatus({
+                    message: "Selecione o arquivo novamente.",
+                    type: "error"
+                  });
+                  setFailedFiles([]);
+                  return;
+                }
+                // 2. "Tentar reindexar falhos" deve passar por apiFetch no momento do clique, sem reutilizar token antigo
+                if (auth.currentUser) {
+                  try {
+                    await auth.currentUser.getIdToken(true);
+                  } catch (e) {
+                    console.warn("[reindex] Falha ao renovar token no clique:", e);
+                  }
+                }
+                handleUploadFiles(arquivosComConteudo);
+              }}
               className="w-full flex items-center justify-center gap-1.5 bg-rose-600 hover:bg-rose-500 text-white text-[10px] font-semibold py-1.5 px-3 rounded-md transition-all self-end cursor-pointer font-sans"
             >
               <RefreshCw className="w-3 h-3 animate-pulse" />
@@ -755,9 +822,10 @@ export default function SourcesPanel({
           <>
             {/* Cards Temporários de Indexação Paralela Ativa */}
             {uploading && Object.entries(uploadProgress.files).map(([name, val]) => {
-              const info = val as { progress: number; status: "pending" | "uploading" | "success" | "error"; attempt?: number; error?: string };
+              const info = val as { progress: number; status: "pending" | "uploading" | "success" | "error" | "warning"; attempt?: number; error?: string };
               if (info.status === "success") return null;
               const isError = info.status === "error";
+              const isWarning = info.status === "warning";
               
               return (
                 <div 
@@ -765,6 +833,8 @@ export default function SourcesPanel({
                   className={`p-2.5 rounded-lg border relative overflow-hidden flex flex-col gap-1.5 transition-all ${
                     isError 
                       ? "border-rose-500/30 bg-rose-500/5 text-rose-300" 
+                      : isWarning
+                      ? "border-amber-500/30 bg-amber-500/5 text-amber-500 dark:text-amber-400"
                       : "border-blue-500/20 bg-blue-500/5 text-slate-300 animate-pulse"
                   }`}
                 >
@@ -772,14 +842,16 @@ export default function SourcesPanel({
                     <div className="flex items-center gap-2 min-w-0 flex-1">
                       {isError ? (
                         <XCircle className="w-3.5 h-3.5 text-rose-500 flex-shrink-0" />
+                      ) : isWarning ? (
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-500 flex-shrink-0" />
                       ) : (
                         <RefreshCw className="w-3.5 h-3.5 text-blue-400 animate-spin flex-shrink-0" />
                       )}
-                      <span className={`truncate pr-1 block font-sans font-medium ${isError ? "text-rose-700" : "text-[var(--cor-texto)]"}`}>
+                      <span className={`truncate pr-1 block font-sans font-medium ${isError ? "text-rose-700 dark:text-rose-400" : isWarning ? "text-amber-600 dark:text-amber-400" : "text-[var(--cor-texto)]"}`}>
                         {name}
                       </span>
                     </div>
-                    {!isError && (
+                    {!isError && !isWarning && (
                       <span className="text-[10px] font-mono text-blue-400 font-semibold flex-shrink-0">
                         {info.progress}%
                       </span>
@@ -787,21 +859,23 @@ export default function SourcesPanel({
                   </div>
                   
                   <div className="text-[9px] font-mono flex items-start justify-between gap-2">
-                    <span className={isError ? "text-rose-400 font-medium whitespace-normal break-words leading-relaxed" : "text-slate-500"}>
+                    <span className={isError ? "text-rose-400 font-medium whitespace-normal break-words leading-relaxed" : isWarning ? "text-amber-600 dark:text-amber-400 font-medium whitespace-normal break-words leading-relaxed" : "text-slate-500"}>
                       {isError 
                         ? (info.error || "Falha na indexação.") 
+                        : isWarning
+                        ? (info.error || "Aviso no processamento.")
                         : info.status === "uploading" 
                           ? (info.error || "Processando e indexando...")
                           : "Na fila..."}
                     </span>
-                    {info.attempt && info.attempt > 1 && !isError && (
+                    {info.attempt && info.attempt > 1 && !isError && !isWarning && (
                       <span className="text-amber-500 font-semibold bg-amber-500/10 px-1 rounded flex-shrink-0 text-[8px]">
                         Tenta {info.attempt}/3
                       </span>
                     )}
                   </div>
 
-                  {!isError && (
+                  {!isError && !isWarning && (
                     /* Mini barra de progresso azul dentro do card */
                     <div className="w-full bg-slate-900 h-1 rounded-full overflow-hidden mt-0.5">
                       <div 
@@ -839,50 +913,82 @@ export default function SourcesPanel({
                   <div 
                     key={file.id}
                     onClick={() => onToggleFile(file.id)}
-                    className={`flex items-center justify-between gap-2 p-2 rounded-lg cursor-pointer border transition-all text-xs group ${
+                    className={`flex items-center justify-between gap-2.5 p-2.5 rounded-xl cursor-pointer border transition-all text-xs group ${
                       isSelected 
-                        ? "bg-[var(--cor-primaria-clara)] border-[var(--cor-borda-primaria)] text-[var(--cor-texto)] hover:bg-[var(--cor-hover)]" 
-                        : "bg-[var(--cor-card-fundo)] border-[var(--cor-borda)] text-[var(--cor-texto)] hover:bg-[var(--cor-hover)]"
+                        ? "bg-[var(--cor-primaria-clara)] border-[var(--cor-borda-primaria)] text-[var(--cor-texto)] shadow-2xs" 
+                        : "bg-[var(--cor-card-fundo)] border-[var(--cor-borda)] text-[var(--cor-texto)] hover:bg-[var(--cor-hover)] hover:border-[var(--cor-borda-primaria)]"
                     }`}
                     title={`${file.name} (${file.clientName} | ${file.robotName})`}
                   >
-                    <div className="flex items-center gap-2 min-w-0 flex-1">
+                    <div className="flex items-center gap-2.5 min-w-0 flex-1">
                       {/* Checkbox */}
-                      <div className="flex-shrink-0">
+                      <div className="flex-shrink-0 text-[var(--cor-texto-secundario)] group-hover:text-[var(--cor-primaria)] transition-colors">
                         {isSelected ? (
                           <CheckSquare className="w-4 h-4 text-[var(--cor-primaria)]" />
                         ) : (
-                          <Square className="w-4 h-4 text-[var(--cor-texto-secundario)] hover:text-[var(--cor-primaria)]" />
+                          <Square className="w-4 h-4" />
                         )}
                       </div>
 
                       {/* Ícone do Formato */}
-                      {getFileIcon(file.name, file.origin)}
+                      <div className="flex-shrink-0">
+                        {getFileIcon(file.name, file.origin)}
+                      </div>
 
-                      {/* Nome do Arquivo (Truncado com reticências) */}
-                      <div className="flex flex-col min-w-0">
-                        <span className="truncate font-medium block pr-1 text-[var(--cor-texto)]">
-                          {file.name}
-                        </span>
-                        <span className="text-[10px] text-[var(--cor-texto-secundario)] truncate block">
-                          {file.origin === "SharePoint" || file.clientId === "sharepoint"
-                            ? `SharePoint • ${file.folderPath || file.robotName}`
-                            : isUploaded
-                            ? "Arquivo local"
-                            : `${file.clientName.split(" (")[0]}`}
-                        </span>
+                      {/* Nome do Arquivo e Metadados */}
+                      <div className="flex flex-col min-w-0 flex-1">
+                        <div className="flex items-center gap-1.5 min-w-0">
+                          <span className="truncate font-medium text-xs text-[var(--cor-texto)]" title={file.name}>
+                            {file.name}
+                          </span>
+                          {file.tipoDocumento && (
+                            <span 
+                              className="text-[9px] font-semibold px-1.5 py-0.5 rounded-md bg-[var(--cor-superficie)] text-[var(--cor-primaria)] border border-[var(--cor-borda)] flex-shrink-0"
+                              title={`Tipo: ${file.tipoDocumento}`}
+                            >
+                              {file.tipoDocumento}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex items-center gap-1 text-[11px] text-[var(--cor-texto-secundario)] truncate mt-0.5">
+                          <span className="truncate">
+                            {file.origin === "SharePoint" || file.clientId === "sharepoint"
+                              ? `SharePoint • ${file.folderPath || file.robotName}`
+                              : isUploaded
+                              ? "Arquivo local"
+                              : `${file.clientName.split(" (")[0]}`}
+                          </span>
+                          {file.size && (
+                            <>
+                              <span className="opacity-40">•</span>
+                              <span className="flex-shrink-0 text-[10px]">{file.size}</span>
+                            </>
+                          )}
+                        </div>
                       </div>
                     </div>
 
-                    {/* Ação de Excluir Fonte / Tamanho do Arquivo */}
-                    <div className="flex items-center gap-2 flex-shrink-0">
-                      <span className="text-[10px] text-[var(--cor-texto-secundario)]">
-                        {file.size || "15 KB"}
-                      </span>
+                    {/* Ações Rápidas (Ver conteúdo e Excluir) */}
+                    <div className="flex items-center gap-1 flex-shrink-0 opacity-80 group-hover:opacity-100 transition-opacity">
                       <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setPreviewFile(file);
+                        }}
+                        className="p-1.5 text-[var(--cor-texto-secundario)] hover:text-[var(--cor-primaria)] hover:bg-[var(--cor-superficie)] rounded-lg transition-colors cursor-pointer"
+                        title="Ver conteúdo extraído"
+                        aria-label="Ver conteúdo extraído"
+                      >
+                        <Eye className="w-3.5 h-3.5" />
+                      </button>
+
+                      <button
+                        type="button"
                         onClick={(e) => handleDelete(e, file.id)}
-                        className="p-1.5 text-[var(--cor-texto-secundario)] hover:text-rose-600 hover:bg-rose-500/10 rounded-md transition-colors cursor-pointer"
+                        className="p-1.5 text-[var(--cor-texto-secundario)] hover:text-rose-500 hover:bg-rose-500/10 rounded-lg transition-colors cursor-pointer"
                         title="Excluir fonte permanentemente"
+                        aria-label="Excluir fonte"
                       >
                         <Trash2 className="w-3.5 h-3.5" />
                       </button>
@@ -906,6 +1012,64 @@ export default function SourcesPanel({
         isOpen={showSharePointBrowser}
         onClose={() => setShowSharePointBrowser(false)}
         onImport={handleImportSharePointFile}
+      />
+
+      {/* Modal de Confirmação de Nova Versão (Mesmo Nome, Checksum Diferente) */}
+      {versionConflict && (
+        <div className="fixed inset-0 bg-black/60 backdrop-blur-xs flex items-center justify-center p-4 z-50 animate-fade-in">
+          <div className="bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-2xl max-w-sm w-full p-5 shadow-2xl space-y-4 animate-scale-up">
+            <div className="flex items-start gap-3">
+              <div className="p-2.5 rounded-xl bg-amber-500/10 text-amber-500 flex-shrink-0">
+                <AlertTriangle className="w-5 h-5" />
+              </div>
+              <div className="space-y-1">
+                <h3 className="text-sm font-semibold text-[var(--cor-texto)]">
+                  Nova versão detectada
+                </h3>
+                <p className="text-xs text-[var(--cor-texto-secundario)] leading-relaxed">
+                  Já existe um arquivo com o nome <strong>"{versionConflict.existingFileName}"</strong> nesta conversa com conteúdo diferente.
+                </p>
+                <p className="text-xs text-[var(--cor-texto-secundario)]">
+                  Escolha como deseja prosseguir com a importação:
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => handleResolveVersionConflict("replace")}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold rounded-xl bg-[var(--cor-balaousuario-fundo)] text-white hover:opacity-90 transition-all cursor-pointer shadow-xs"
+              >
+                <span>Substituir versão anterior</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => handleResolveVersionConflict("keep_both")}
+                className="w-full flex items-center justify-center gap-2 px-4 py-2.5 text-xs font-semibold rounded-xl border border-[var(--cor-borda)] text-[var(--cor-texto)] hover:bg-[var(--cor-hover)] transition-all cursor-pointer"
+              >
+                <span>Manter ambos</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => setVersionConflict(null)}
+                className="w-full py-2 text-xs font-medium text-[var(--cor-texto-secundario)] hover:text-[var(--cor-texto)] transition-colors cursor-pointer text-center"
+              >
+                Cancelar
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Modal de Conteúdo Extraído (Markdown) */}
+      <ExtractedContentModal
+        isOpen={Boolean(previewFile)}
+        onClose={() => setPreviewFile(null)}
+        file={previewFile}
+        userEmail={userEmail}
       />
     </div>
   );

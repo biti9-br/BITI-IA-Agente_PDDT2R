@@ -1,36 +1,143 @@
 {
   "entities": {
-    "users": {
-      "fields": {
-        "email": { "type": "string" },
-        "createdAt": { "type": "string" }
-      }
+    "userFile": {
+      "title": "User File",
+      "description": "Metadata for an indexed file associated with a user",
+      "type": "object",
+      "properties": {
+        "fileId": { "type": "string" },
+        "fileName": { "type": "string" },
+        "conversationId": { "type": "string" },
+        "clientId": { "type": "string" },
+        "clientName": { "type": "string" },
+        "robotId": { "type": "string" },
+        "robotName": { "type": "string" },
+        "modifiedTime": { "type": "string" },
+        "size": { "type": "string" },
+        "chunkCount": { "type": "number" },
+        "indexedAt": { "type": "string" },
+        "origin": { "type": "string" },
+        "folderPath": { "type": "string" },
+        "originalName": { "type": "string" },
+        "checksum": { "type": "string" },
+        "tipoDocumento": { "type": "string" },
+        "confiancaValidacao": { "type": "number" },
+        "justificativaValidacao": { "type": "string" },
+        "formatoConteudo": { "type": "string" },
+        "versaoConversor": { "type": "number" }
+      },
+      "required": ["fileId", "fileName", "checksum"]
     },
-    "conversas": {
-      "fields": {
-        "mensagens": { "type": "array" },
-        "mensagensIndexadas": { "type": "number" },
-        "criadoEm": { "type": "timestamp" },
-        "atualizadoEm": { "type": "timestamp" }
-      }
+    "fileContentPart": {
+      "title": "File Content Part",
+      "description": "Full markdown content split into chunks up to 800KB for Firestore storage",
+      "type": "object",
+      "properties": {
+        "text": { "type": "string" },
+        "partIndex": { "type": "number" },
+        "totalParts": { "type": "number" }
+      },
+      "required": ["text", "partIndex", "totalParts"]
     },
-    "chunks": {
-      "fields": {
-        "uid": { "type": "string" },
-        "conversaId": { "type": "string" },
-        "role": { "type": "string" },
-        "texto": { "type": "string" },
-        "criadoEm": { "type": "timestamp" }
-      }
+    "userChunk": {
+      "title": "Vector Chunk",
+      "description": "Individual structural text chunk with vector embeddings for semantic search",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "fileId": { "type": "string" },
+        "conversationId": { "type": "string" },
+        "fileName": { "type": "string" },
+        "clientId": { "type": "string" },
+        "clientName": { "type": "string" },
+        "robotId": { "type": "string" },
+        "robotName": { "type": "string" },
+        "text": { "type": "string" },
+        "secao": { "type": "string" },
+        "embedding": { "type": "array" }
+      },
+      "required": ["id", "fileId", "text"]
     },
-    "consultas": {
-      "fields": {
-        "titulo": { "type": "string" },
-        "criadoEm": { "type": "timestamp" }
-      }
+    "userSession": {
+      "title": "Chat Session",
+      "description": "Metadata and learned facts for a conversation session",
+      "type": "object",
+      "properties": {
+        "sessionId": { "type": "string" },
+        "learnedFacts": { "type": "array" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" },
+        "title": { "type": "string" }
+      },
+      "required": ["sessionId"]
+    },
+    "sessionMessage": {
+      "title": "Session Message",
+      "description": "Individual chat message stored inside a session subcollection",
+      "type": "object",
+      "properties": {
+        "sender": { "type": "string", "enum": ["user", "assistant"] },
+        "text": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "order": { "type": "number" }
+      },
+      "required": ["sender", "text", "createdAt"]
+    },
+    "adminList": {
+      "title": "Admin List",
+      "description": "List of administrator emails",
+      "type": "object",
+      "properties": {
+        "emails": { "type": "array" }
+      },
+      "required": ["emails"]
+    },
+    "documentType": {
+      "title": "Document Type",
+      "description": "Custom technical document type definition",
+      "type": "object",
+      "properties": {
+        "sigla": { "type": "string" },
+        "nome": { "type": "string" },
+        "descricao": { "type": "string" },
+        "promptValidacao": { "type": "string" },
+        "secoesObrigatorias": { "type": "array" },
+        "ativo": { "type": "boolean" },
+        "criadoPor": { "type": "string" },
+        "atualizadoPor": { "type": "string" },
+        "atualizadoEm": { "type": "string" }
+      },
+      "required": ["sigla", "nome", "promptValidacao"]
     }
   },
   "firestore": {
-    "indexes": []
+    "/users/{email}/files/{fileId}": {
+      "schema": "userFile",
+      "description": "Files indexed by user"
+    },
+    "/users/{email}/files/{fileId}/content/{partId}": {
+      "schema": "fileContentPart",
+      "description": "Full extracted markdown content in parts up to 800KB"
+    },
+    "/users/{email}/chunks/{chunkId}": {
+      "schema": "userChunk",
+      "description": "Vector chunks of indexed documents for semantic RAG search"
+    },
+    "/users/{email}/sessions/{sessionId}": {
+      "schema": "userSession",
+      "description": "Chat session metadata and learned memory facts"
+    },
+    "/users/{email}/sessions/{sessionId}/messages/{messageId}": {
+      "schema": "sessionMessage",
+      "description": "Individual chat messages inside session subcollection"
+    },
+    "/settings/admins": {
+      "schema": "adminList",
+      "description": "System administrator email list"
+    },
+    "/settings/document_types/{typeId}": {
+      "schema": "documentType",
+      "description": "Document type catalog"
+    }
   }
 }

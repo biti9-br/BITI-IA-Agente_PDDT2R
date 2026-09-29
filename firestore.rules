@@ -1,20 +1,22 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /users/{userId} {
-      allow read, write: if request.auth != null && request.auth.uid == userId;
-
-      match /conversas/{conversaId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
-      match /consultas/{consultaId} {
-        allow read, write: if request.auth != null && request.auth.uid == userId;
-      }
+    function isBiti9() {
+      return request.auth != null
+        && request.auth.token.firebase.sign_in_provider == 'microsoft.com'
+        && request.auth.token.email.matches('.*@biti9[.]com[.]br$');
     }
 
-    match /chunks/{chunkId} {
-      allow read, write: if request.auth != null && request.auth.uid == resource.data.uid;
-      allow create: if request.auth != null && request.auth.uid == request.resource.data.uid;
+    match /users/{document=**} {
+      allow read, write: if false;
+    }
+
+    match /settings/{document=**} {
+      allow read: if isBiti9();
+      allow write: if false;
     }
   }
 }
+
+
+

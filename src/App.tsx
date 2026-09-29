@@ -1,10 +1,12 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Database, User, LogOut, Sparkles, Plus, History, ChevronDown, Sun, Moon } from "lucide-react";
+import { Database, User, LogOut, Sparkles, Plus, History, ChevronDown, Sun, Moon, ShieldCheck } from "lucide-react";
 import ChatPanel from "./components/ChatPanel";
 import SourcesPanel from "./components/SourcesPanel";
 import TelaDeLogin from "./components/TelaDeLogin";
+import AdminDocumentTypesModal from "./components/AdminDocumentTypesModal";
 import { useAuth } from "./hooks/useAuth";
 import { useDbStatus } from "./hooks/useDbStatus";
+import { apiFetch } from "./services/api";
 import { useTheme } from "./hooks/useTheme";
 
 export default function App() {
@@ -16,6 +18,8 @@ export default function App() {
   const [headerMenuOpen, setHeaderMenuOpen] = useState(false);
   const [triggerNewSession, setTriggerNewSession] = useState(0);
   const [triggerOpenHistory, setTriggerOpenHistory] = useState(0);
+  const [isAdmin, setIsAdmin] = useState(false);
+  const [showAdminModal, setShowAdminModal] = useState(false);
   const headerMenuRef = useRef<HTMLDivElement>(null);
 
   // Filtros de seleção rápida
@@ -41,6 +45,20 @@ export default function App() {
       setSelectedFileIds([]);
     }
   }, [triggerNewSession, setSelectedFileIds]);
+
+  // Checar se o usuário é administrador (settings/admins)
+  useEffect(() => {
+    if (userEmail) {
+      apiFetch("/api/settings/admins/check")
+        .then(res => res.json())
+        .then(data => {
+          setIsAdmin(Boolean(data && data.isAdmin));
+        })
+        .catch(() => setIsAdmin(false));
+    } else {
+      setIsAdmin(false);
+    }
+  }, [userEmail]);
 
   // Fecha o menu suspenso ao clicar fora
   useEffect(() => {
@@ -190,6 +208,26 @@ export default function App() {
                       {theme === "dark" ? "Escuro" : "Claro"}
                     </span>
                   </button>
+
+                  {/* Item de Administração - Visível apenas para e-mails em settings/admins */}
+                  {isAdmin && (
+                    <>
+                      <div className="my-1 border-t border-[var(--cor-borda)]" />
+                      <div className="px-4 py-1 text-[10px] font-semibold text-[var(--cor-texto-secundario)] uppercase tracking-wider">
+                        Administração
+                      </div>
+                      <button
+                        onClick={() => {
+                          setHeaderMenuOpen(false);
+                          setShowAdminModal(true);
+                        }}
+                        className="w-full flex items-center gap-2.5 px-4 py-2 text-xs text-indigo-500 dark:text-indigo-400 hover:bg-[var(--cor-superficie)] transition-colors cursor-pointer text-left font-medium"
+                      >
+                        <ShieldCheck className="w-3.5 h-3.5 flex-shrink-0" />
+                        <span>Tipos de documento</span>
+                      </button>
+                    </>
+                  )}
                 </div>
 
                 <div className="my-1 border-t border-[var(--cor-borda)]" />
@@ -238,7 +276,7 @@ export default function App() {
             clientGroups={dbStatus.clientGroups}
             onResetFilters={handleResetFilters}
             userEmail={userEmail}
-            token="unauthenticated-public-drive-flow"
+            token=""
             onRefresh={() => loadDbStatus(activeSessionId)}
             selectedFileIds={selectedFileIds}
             activeSessionId={activeSessionId}
@@ -252,6 +290,18 @@ export default function App() {
           />
         </main>
       </div>
+
+      {/* Modal de Administração de Tipos de Documentos */}
+      {isAdmin && (
+        <AdminDocumentTypesModal
+          isOpen={showAdminModal}
+          onClose={() => setShowAdminModal(false)}
+          userEmail={userEmail}
+          onTypesUpdated={() => {
+            loadDbStatus(activeSessionId);
+          }}
+        />
+      )}
     </div>
   );
 }

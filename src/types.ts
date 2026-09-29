@@ -15,6 +15,26 @@ export interface PDDDocument {
   origin?: 'SharePoint' | 'Arquivo local' | string;
   folderPath?: string;
   originalName?: string;
+  checksum?: string;
+  tipoDocumento?: string;
+  confiancaValidacao?: number;
+  justificativaValidacao?: string;
+  formatoConteudo?: 'markdown' | string;
+  versaoConversor?: number;
+  markdownContent?: string;
+}
+
+export interface DocumentTypeConfig {
+  id: string;
+  sigla: string;
+  nome: string;
+  descricao: string;
+  promptValidacao: string;
+  secoesObrigatorias: string[];
+  ativo: boolean;
+  criadoPor: string;
+  atualizadoPor: string;
+  atualizadoEm: string;
 }
 
 export interface ClientGroup {
@@ -39,7 +59,10 @@ export interface VectorChunk {
   robotId: string;
   robotName: string;
   text: string;
+  secao?: string;
   embedding?: number[];
+  embeddingModelo?: string;
+  embeddingDim?: number;
 }
 
 export interface IndexingStatus {
@@ -71,7 +94,9 @@ export interface ChatMessage {
     clientName: string;
     robotName: string;
     text: string;
+    secao?: string;
     score: number;
+    distancia?: number;
   }>;
 }
 
@@ -111,6 +136,13 @@ export interface VectorDatabase {
     origin?: string;
     folderPath?: string;
     originalName?: string;
+    checksum?: string;
+    tipoDocumento?: string;
+    confiancaValidacao?: number;
+    justificativaValidacao?: string;
+    formatoConteudo?: string;
+    versaoConversor?: number;
+    markdownContent?: string;
   }>;
   chunks: VectorChunk[];
   rootFolderId: string;

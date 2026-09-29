@@ -1,6 +1,4 @@
-import { ref as storageRef, uploadBytes, getDownloadURL } from "firebase/storage";
-import { collection, addDoc, getDocs, query, orderBy, serverTimestamp } from "firebase/firestore";
-import { db, storage, auth } from "../firebase";
+import { apiFetch } from "./api";
 import { jsPDF } from "jspdf";
 
 export interface ConsultaDoc {
@@ -17,43 +15,31 @@ export async function salvarConsultaPDF(
   titulo: string,
   tipo: string
 ): Promise<string> {
-  if (!uid) throw new Error("UID do usuário é obrigatório.");
-  if (!auth.currentUser || auth.currentUser.uid !== uid) {
-    return URL.createObjectURL(pdfBlob);
+  const localUrl = URL.createObjectURL(pdfBlob);
+  try {
+    await apiFetch("/api/consultas", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        titulo,
+        tipo,
+        pdfUrl: localUrl
+      })
+    });
+  } catch (err) {
+    console.warn("Aviso ao salvar consulta via API:", err);
   }
-
-  const sanitizado = titulo.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 40);
-  const caminho = `users/${uid}/consultas/${Date.now()}_${sanitizado}.pdf`;
-  const fileRef = storageRef(storage, caminho);
-
-  await uploadBytes(fileRef, pdfBlob, {
-    contentType: "application/pdf",
-  });
-  const pdfUrl = await getDownloadURL(fileRef);
-
-  await addDoc(collection(db, "users", uid, "consultas"), {
-    titulo,
-    tipo,
-    pdfUrl,
-    caminhoStorage: caminho,
-    criadoEm: serverTimestamp(),
-  });
-
-  return pdfUrl;
+  return localUrl;
 }
 
 export async function carregarConsultas(uid: string): Promise<ConsultaDoc[]> {
-  if (!uid || !auth.currentUser || auth.currentUser.uid !== uid) return [];
   try {
-    const ref = collection(db, "users", uid, "consultas");
-    const q = query(ref, orderBy("criadoEm", "desc"));
-    const snapshot = await getDocs(q);
-    return snapshot.docs.map((d) => ({
-      id: d.id,
-      ...d.data(),
-    })) as ConsultaDoc[];
+    const res = await apiFetch("/api/consultas");
+    if (!res.ok) return [];
+    const data = await res.json();
+    return Array.isArray(data.consultas) ? data.consultas : [];
   } catch (err) {
-    console.warn("Aviso ao carregar consultas:", err);
+    console.warn("Aviso ao carregar consultas via API:", err);
     return [];
   }
 }
@@ -117,3 +103,4 @@ export function gerarBlobPDF(titulo: string, tipo: string, texto: string): Blob 
 
   return doc.output("blob");
 }
+

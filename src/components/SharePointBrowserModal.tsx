@@ -19,26 +19,31 @@ import {
   ChevronUp,
   Copy,
   Check,
-  Trash2
+  Trash2,
+  Sparkles,
+  AlertTriangle
 } from "lucide-react";
 import {
   resolverSiteId,
   encontrarBibliotecaDriveId,
   listarItensSharePoint,
   carregarProximosItensSharePoint,
-  baixarArquivoSharePoint,
+  obterArquivoSharePointEmMemoria,
   SharePointItem,
   GraphError,
   GraphLogEntry,
   subscribeGraphLogs,
-  clearGraphLogs
+  clearGraphLogs,
+  getLastResolvedSite
 } from "../services/sharepointService";
 import { SHAREPOINT_HOSTNAME, SHAREPOINT_SITE_PATH, SHAREPOINT_LIBRARY } from "../config/sharepoint";
+import { apiFetch } from "../services/api";
+import { getMemoryToken, reautenticarMicrosoft } from "../auth";
 
 interface SharePointBrowserModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onImport: (blob: Blob, fileName: string, folderPath: string) => Promise<void>;
+  onImport: (file: File, folderPath: string) => Promise<any>;
 }
 
 interface BreadcrumbItem {
@@ -53,6 +58,8 @@ export default function SharePointBrowserModal({
 }: SharePointBrowserModalProps) {
   const [siteId, setSiteId] = useState<string | null>(null);
   const [driveId, setDriveId] = useState<string | null>(null);
+  const [activeSiglas, setActiveSiglas] = useState<string[]>([]);
+  const [loadingTypes, setLoadingTypes] = useState(true);
   const [folderStack, setFolderStack] = useState<BreadcrumbItem[]>([
     { id: undefined, name: SHAREPOINT_LIBRARY }
   ]);
@@ -63,7 +70,39 @@ export default function SharePointBrowserModal({
   const [loading, setLoading] = useState(false);
   const [loadingMore, setLoadingMore] = useState(false);
   const [importing, setImporting] = useState(false);
+  const [reauthenticating, setReauthenticating] = useState(false);
+  const [hasGraphToken, setHasGraphToken] = useState<boolean>(() => Boolean(getMemoryToken()));
   const [error, setError] = useState<string | null>(null);
+  const [warning, setWarning] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (isOpen) {
+      apiFetch("/api/settings/document-types/active")
+        .then(res => res.json())
+        .then(data => {
+          if (Array.isArray(data.siglas) && data.siglas.length > 0) {
+            setActiveSiglas(data.siglas);
+          }
+        })
+        .catch(() => {});
+    }
+  }, [isOpen]);
+
+  // Reautenticar na Microsoft quando o token em memória não estiver disponível (ex: após F5)
+  const handleReautenticarMicrosoft = async () => {
+    setReauthenticating(true);
+    setError(null);
+    try {
+      await reautenticarMicrosoft();
+      setHasGraphToken(true);
+      await inicializarSharePoint();
+    } catch (err: any) {
+      console.error("Erro na autenticação com Microsoft:", err);
+      setError(err?.message || "Falha na reautenticação com a Microsoft.");
+    } finally {
+      setReauthenticating(false);
+    }
+  };
 
   // Painel de diagnóstico de chamadas Microsoft Graph
   const [showDiagnostics, setShowDiagnostics] = useState(false);
@@ -91,6 +130,22 @@ export default function SharePointBrowserModal({
       // Ignora restrição de clipboard
     }
   };
+
+  // Carrega tipos permitidos da API
+  useEffect(() => {
+    if (isOpen) {
+      setLoadingTypes(true);
+      apiFetch("/api/settings/document-types/active")
+        .then(res => res.json())
+        .then(data => {
+          if (Array.isArray(data.siglas)) {
+            setActiveSiglas(data.siglas);
+          }
+        })
+        .catch(() => {})
+        .finally(() => setLoadingTypes(false));
+    }
+  }, [isOpen]);
 
   const currentFolder = folderStack[folderStack.length - 1];
 
@@ -121,6 +176,13 @@ export default function SharePointBrowserModal({
 
   // Inicialização: resolve site e biblioteca Drive
   const inicializarSharePoint = useCallback(async () => {
+    const token = getMemoryToken();
+    if (!token) {
+      setHasGraphToken(false);
+      return;
+    }
+
+    setHasGraphToken(true);
     setLoading(true);
     setError(null);
     setFolderStack([{ id: undefined, name: SHAREPOINT_LIBRARY }]);
@@ -135,6 +197,9 @@ export default function SharePointBrowserModal({
       await carregarPasta(dId, undefined);
     } catch (err: any) {
       console.error("Erro ao inicializar SharePoint:", err);
+      if (err instanceof GraphError && (err.statusCode === 401 || err.statusCode === 403)) {
+        setHasGraphToken(false);
+      }
       setError(err.message || "Erro ao conectar ao SharePoint.");
     } finally {
       setLoading(false);
@@ -143,7 +208,12 @@ export default function SharePointBrowserModal({
 
   useEffect(() => {
     if (isOpen) {
-      inicializarSharePoint();
+      setError(null);
+      const tokenPresente = Boolean(getMemoryToken());
+      setHasGraphToken(tokenPresente);
+      if (tokenPresente) {
+        inicializarSharePoint();
+      }
     } else {
       setItems([]);
       setSelectedItem(null);
@@ -199,17 +269,37 @@ export default function SharePointBrowserModal({
     setImporting(true);
     setError(null);
 
-    // Caminho da pasta formatado para auditoria e metadados
+    // Caminho da pasta formatado para auditoria e metadados no agente
     const folderPath = "/" + folderStack.map((f) => f.name).join("/");
+    const fileName = selectedItem.name;
+    const mimeHint = selectedItem.file?.mimeType;
 
     try {
-      const blob = await baixarArquivoSharePoint(driveId, selectedItem.id);
-      await onImport(blob, selectedItem.name, folderPath);
-      onClose();
+      // 1. Busca o conteúdo com fetch GET /drives/{drive-id}/items/{item-id}/content
+      // 2. Lê a resposta com response.blob() mantendo SOMENTE em memória
+      // 3. Cria um objeto File em memória com o nome original e tipo
+      const file = await obterArquivoSharePointEmMemoria(
+        driveId,
+        selectedItem.id,
+        fileName,
+        mimeHint
+      );
+
+      // e entregue direto ao mesmo fluxo de processamento usado pelo upload local
+      const res = await onImport(file, folderPath);
+      if (res && res.warning) {
+        setWarning(res.warning);
+        setImporting(false);
+      } else {
+        onClose();
+      }
     } catch (err: any) {
-      console.error("Erro ao baixar ou importar arquivo do SharePoint:", err);
-      setError(err.message || "Falha ao baixar o arquivo do SharePoint.");
-    } finally {
+      console.error("Erro ao obter arquivo do SharePoint:", err);
+      if (err.isWarning || err.code === "ALREADY_EXISTS_SAME_CONVERSATION") {
+        setWarning(err.message);
+      } else {
+        setError(err.message || "Falha ao obter o arquivo do SharePoint.");
+      }
       setImporting(false);
     }
   };
@@ -363,6 +453,20 @@ export default function SharePointBrowserModal({
               </div>
             </div>
 
+            {/* Informações do Site SharePoint Conectado */}
+            {getLastResolvedSite() && (
+              <div className="px-4 py-1.5 bg-slate-900/60 border-b border-slate-800 text-[11px] text-slate-300 flex items-center justify-between">
+                <div className="truncate">
+                  <span className="text-slate-400">Site conectado: </span>
+                  <span className="font-semibold text-emerald-400">{getLastResolvedSite()?.name || "Site"}</span>
+                  <span className="text-slate-500 ml-2">({getLastResolvedSite()?.webUrl})</span>
+                </div>
+                <span className="text-[10px] text-slate-400 font-mono ml-2 flex-shrink-0">
+                  ID: {getLastResolvedSite()?.id?.split(",")[1]?.substring(0, 8) || getLastResolvedSite()?.id?.substring(0, 8)}...
+                </span>
+              </div>
+            )}
+
             <div className="flex-1 overflow-y-auto p-3 space-y-2.5 font-mono text-[11px] max-h-60 scrollbar-thin">
               {logs.length === 0 ? (
                 <p className="text-slate-500 italic py-2 text-center">Nenhuma chamada ao Graph registrada nesta sessão.</p>
@@ -431,8 +535,25 @@ export default function SharePointBrowserModal({
           </div>
         )}
 
-        {/* Mensagem de Erro (401, 403, 404 ou Graph) */}
-        {error && (
+        {/* Mensagem de Aviso (Duplicidade em âmbar) */}
+        {warning && (
+          <div className="mx-5 mt-4 flex items-start gap-2.5 p-3 rounded-xl bg-amber-500/10 border border-amber-500/25 text-amber-600 dark:text-amber-400 text-xs animate-fade-in">
+            <AlertTriangle className="w-4 h-4 flex-shrink-0 mt-0.5 text-amber-500" />
+            <div className="flex-1">
+              <p className="font-semibold">{warning}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setWarning(null)}
+              className="text-amber-500/70 hover:text-amber-500 text-xs ml-1 cursor-pointer font-bold"
+            >
+              ✕
+            </button>
+          </div>
+        )}
+
+        {/* Mensagem de Erro (apenas exibida para erros de rede/permissão com token presente) */}
+        {error && hasGraphToken && (
           <div className="mx-5 mt-4 flex items-start gap-2.5 p-3 rounded-xl bg-rose-500/10 border border-rose-500/25 text-rose-500 text-xs animate-shake">
             <AlertCircle className="w-4 h-4 flex-shrink-0 mt-0.5" />
             <div className="flex-1">
@@ -457,11 +578,6 @@ export default function SharePointBrowserModal({
                   <Terminal className="w-3 h-3" />
                   <span>Abrir Diagnóstico Graph</span>
                 </button>
-                {(error.includes("401") || error.includes("expirou")) && (
-                  <span className="text-[11px] text-[var(--cor-texto-secundario)]">
-                    Clique para abrir a reautenticação Microsoft
-                  </span>
-                )}
               </div>
             </div>
           </div>
@@ -513,6 +629,41 @@ export default function SharePointBrowserModal({
             <div className="flex flex-col items-center justify-center h-64 gap-3 text-[var(--cor-texto-secundario)]">
               <div className="w-8 h-8 border-2 border-[var(--cor-primaria)] border-t-transparent rounded-full animate-spin" />
               <p className="text-xs font-medium">Carregando conteúdo do SharePoint...</p>
+            </div>
+          ) : !hasGraphToken ? (
+            <div className="flex flex-col items-center justify-center h-72 text-center p-6 space-y-4">
+              <div className="w-16 h-16 rounded-2xl bg-sky-500/10 flex items-center justify-center text-[#00a4ef]">
+                <Cloud className="w-8 h-8 stroke-[1.5]" />
+              </div>
+              <div className="max-w-md">
+                <h3 className="text-sm font-semibold text-[var(--cor-texto)]">Autenticação Microsoft necessária</h3>
+                <p className="text-xs text-[var(--cor-texto-secundario)] mt-1.5 leading-relaxed">
+                  Para navegar nas pastas dos projetos e importar documentos diretamente do SharePoint da BITI9, conecte sua conta Microsoft.
+                </p>
+                {error && (
+                  <p className="text-xs text-rose-500 mt-2 font-medium bg-rose-500/10 p-2 rounded-lg border border-rose-500/20">
+                    {error}
+                  </p>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={handleReautenticarMicrosoft}
+                disabled={reauthenticating}
+                className="inline-flex items-center gap-2 px-5 py-2.5 rounded-xl bg-[#00a4ef] hover:bg-[#0092d6] text-white text-xs font-semibold cursor-pointer transition-all shadow-sm hover:shadow"
+              >
+                {reauthenticating ? (
+                  <>
+                    <RefreshCw className="w-4 h-4 animate-spin" />
+                    <span>Conectando à Microsoft...</span>
+                  </>
+                ) : (
+                  <>
+                    <Cloud className="w-4 h-4" />
+                    <span>Reautenticar com Microsoft</span>
+                  </>
+                )}
+              </button>
             </div>
           ) : items.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-64 text-center p-6 text-[var(--cor-texto-secundario)]">
@@ -640,7 +791,11 @@ export default function SharePointBrowserModal({
                 <span className="truncate">Selecionado: <strong>{selectedItem.name}</strong> ({formatSize(selectedItem.size)})</span>
               </span>
             ) : (
-              <span>Selecione um único arquivo para importar e processar como PDD.</span>
+              <span>
+                {loadingTypes
+                  ? "Carregando tipos permitidos..."
+                  : `Selecione um documento de um dos tipos permitidos: ${activeSiglas.join(", ")}`}
+              </span>
             )}
           </div>
 
@@ -662,11 +817,11 @@ export default function SharePointBrowserModal({
               {importing ? (
                 <>
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                  <span>Baixando e importando...</span>
+                  <span>Importando para a memória...</span>
                 </>
               ) : (
                 <>
-                  <Download className="w-3.5 h-3.5" />
+                  <Sparkles className="w-3.5 h-3.5" />
                   <span>Importar arquivo</span>
                 </>
               )}

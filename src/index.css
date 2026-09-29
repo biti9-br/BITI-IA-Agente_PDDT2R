@@ -76,3 +76,127 @@ body {
 .dark .mascote-destaque, [data-theme="dark"] .mascote-destaque {
   filter: drop-shadow(0 4px 14px rgba(56, 189, 248, 0.55)) contrast(1) saturate(1);
 }
+
+/* Estilos de visualização para Markdown Extraído com títulos, tabelas RACI, listas e imagens */
+.markdown-extracted-view h1 {
+  font-size: 1.4rem;
+  font-weight: 700;
+  margin-top: 1.5rem;
+  margin-bottom: 0.75rem;
+  padding-bottom: 0.35rem;
+  border-bottom: 1px solid var(--cor-borda);
+  color: var(--cor-texto);
+}
+
+.markdown-extracted-view h2 {
+  font-size: 1.2rem;
+  font-weight: 700;
+  margin-top: 1.25rem;
+  margin-bottom: 0.5rem;
+  color: var(--cor-texto);
+}
+
+.markdown-extracted-view h3 {
+  font-size: 1.05rem;
+  font-weight: 600;
+  margin-top: 1rem;
+  margin-bottom: 0.4rem;
+  color: var(--cor-texto);
+}
+
+.markdown-extracted-view h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-top: 0.75rem;
+  margin-bottom: 0.35rem;
+  color: var(--cor-texto);
+}
+
+.markdown-extracted-view p {
+  margin-top: 0.5rem;
+  margin-bottom: 0.5rem;
+  line-height: 1.65;
+}
+
+.markdown-extracted-view ul {
+  list-style-type: disc;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+.markdown-extracted-view ol {
+  list-style-type: decimal;
+  padding-left: 1.5rem;
+  margin: 0.5rem 0;
+}
+
+.markdown-extracted-view li {
+  margin: 0.25rem 0;
+  line-height: 1.5;
+}
+
+.markdown-extracted-view table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 1rem 0;
+  font-size: 0.825rem;
+  border: 1px solid var(--cor-borda);
+  border-radius: 0.5rem;
+  overflow: hidden;
+}
+
+.markdown-extracted-view th {
+  background-color: var(--cor-hover);
+  color: var(--cor-texto);
+  font-weight: 600;
+  text-align: left;
+  padding: 0.6rem 0.75rem;
+  border: 1px solid var(--cor-borda);
+}
+
+.markdown-extracted-view td {
+  padding: 0.5rem 0.75rem;
+  border: 1px solid var(--cor-borda);
+  color: var(--cor-texto);
+}
+
+.markdown-extracted-view tr:nth-child(even) td {
+  background-color: var(--cor-superficie);
+}
+
+.markdown-extracted-view blockquote {
+  border-left: 4px solid #0EA5E9;
+  background-color: rgba(14, 165, 233, 0.08);
+  padding: 0.75rem 1rem;
+  margin: 0.85rem 0;
+  border-radius: 0 0.5rem 0.5rem 0;
+  font-style: italic;
+  color: var(--cor-texto);
+}
+
+.markdown-extracted-view code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.825rem;
+  background-color: var(--cor-hover);
+  padding: 0.15rem 0.35rem;
+  border-radius: 0.25rem;
+  border: 1px solid var(--cor-borda);
+}
+
+.markdown-extracted-view pre {
+  margin: 0.85rem 0;
+  padding: 0.75rem 1rem;
+  background-color: #0F172A;
+  color: #F8FAFC;
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  font-size: 0.8rem;
+}
+
+.markdown-extracted-view pre code {
+  background: transparent;
+  padding: 0;
+  border: none;
+  color: inherit;
+}
+

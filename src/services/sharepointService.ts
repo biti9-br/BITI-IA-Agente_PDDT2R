@@ -153,6 +153,12 @@ async function callGraphGet<T>(
     response: responseBodyForLog,
   });
 
+  // Extrai informações detalhadas do erro do Microsoft Graph
+  const graphErrorObj = responseBodyForLog?.error;
+  const graphCode = graphErrorObj?.code ? String(graphErrorObj.code) : "não informado";
+  const graphMessage = graphErrorObj?.message ? String(graphErrorObj.message) : (response.statusText || "não informado");
+  const graphDetails = `(HTTP ${response.status} - error.code: ${graphCode}, error.message: ${graphMessage})`;
+
   // 1. Trata 401 (Sessão expirada): tenta reautenticar via popup e repete a chamada
   if (response.status === 401) {
     if (!isRetry) {
@@ -165,17 +171,29 @@ async function callGraphGet<T>(
         // Falha no popup ou cancelado pelo usuário
       }
     }
-    throw new GraphError(401, "Sua sessão expirou. Entre novamente.");
+    throw new GraphError(
+      401,
+      `Erro HTTP 401: Sua sessão expirou. Entre novamente. ${graphDetails}`,
+      graphCode !== "não informado" ? graphCode : undefined
+    );
   }
 
   // 2. Trata 403 (Sem permissão)
   if (response.status === 403) {
-    throw new GraphError(403, "Você não tem permissão para acessar este conteúdo no SharePoint.");
+    throw new GraphError(
+      403,
+      `Erro HTTP 403: Você não tem permissão para acessar este conteúdo no SharePoint. ${graphDetails}`,
+      graphCode !== "não informado" ? graphCode : undefined
+    );
   }
 
   // 3. Trata 404 (Não encontrado)
   if (response.status === 404) {
-    throw new GraphError(404, "Site ou biblioteca não encontrados. Verifique a configuração.");
+    throw new GraphError(
+      404,
+      `Erro HTTP 404: Site ou biblioteca não encontrados. Verifique a configuração. ${graphDetails}`,
+      graphCode !== "não informado" ? graphCode : undefined
+    );
   }
 
   // 4. Outros erros retornados pelo Graph
@@ -199,10 +217,21 @@ async function callGraphGet<T>(
   return (await response.json()) as T;
 }
 
+export interface ResolvedSiteInfo {
+  id: string;
+  name?: string;
+  webUrl?: string;
+}
+
+let lastResolvedSite: ResolvedSiteInfo | null = null;
+
+export function getLastResolvedSite(): ResolvedSiteInfo | null {
+  return lastResolvedSite;
+}
+
 /**
  * 1. Resolve o site do SharePoint:
- * GET https://graph.microsoft.com/v1.0/sites/{SHAREPOINT_HOSTNAME}:{SHAREPOINT_SITE_PATH}
- * Com fallbacks resilientes para tenants corporativos delegados.
+ * Usa exclusivamente GET https://graph.microsoft.com/v1.0/sites/{hostname}:{site-path} da configuração.
  */
 export async function resolverSiteId(): Promise<string> {
   const cleanHost = SHAREPOINT_HOSTNAME.replace(/[\[\]]/g, "")
@@ -213,54 +242,17 @@ export async function resolverSiteId(): Promise<string> {
   if (!cleanPath.startsWith("/")) {
     cleanPath = `/${cleanPath}`;
   }
-  const siteName = cleanPath.split("/").filter(Boolean).pop() || "portfolio";
 
-  // Tentativa 1: Formato padrão documentado pelo Graph
-  try {
-    const url = `https://graph.microsoft.com/v1.0/sites/${cleanHost}:${cleanPath}`;
-    const data = await callGraphGet<{ id: string; name?: string; webUrl?: string }>(url);
-    if (data?.id) return data.id;
-  } catch (err: any) {
-    console.warn("Tentativa 1 de resolução de site falhou:", err.message);
-  }
-
-  // Tentativa 2: Formato com /sites/root:{cleanPath}
-  try {
-    const urlRoot = `https://graph.microsoft.com/v1.0/sites/root:${cleanPath}`;
-    const data = await callGraphGet<{ id: string; name?: string; webUrl?: string }>(urlRoot);
-    if (data?.id) return data.id;
-  } catch (err: any) {
-    console.warn("Tentativa 2 de resolução via root falhou:", err.message);
-  }
-
-  // Tentativa 3: Busca direta pelo nome do site
-  try {
-    const urlSearch = `https://graph.microsoft.com/v1.0/sites?search=${encodeURIComponent(siteName)}`;
-    const data = await callGraphGet<{ value: Array<{ id: string; name: string; webUrl?: string }> }>(urlSearch);
-    const sites = data?.value || [];
-    const matched = sites.find(
-      (s) =>
-        s.name.toLowerCase() === siteName.toLowerCase() ||
-        (s.webUrl && s.webUrl.toLowerCase().includes(siteName.toLowerCase()))
-    );
-    if (matched?.id) return matched.id;
-    if (sites.length > 0 && sites[0].id) return sites[0].id;
-  } catch (err: any) {
-    console.warn("Tentativa 3 de busca de site falhou:", err.message);
-  }
-
-  // Tentativa 4: Formato /sites/root:/sites/{siteName}
-  try {
-    const urlRootSite = `https://graph.microsoft.com/v1.0/sites/root:/sites/${encodeURIComponent(siteName)}`;
-    const data = await callGraphGet<{ id: string; name?: string; webUrl?: string }>(urlRootSite);
-    if (data?.id) return data.id;
-  } catch (err: any) {
-    console.warn("Tentativa 4 via root:/sites/{site} falhou:", err.message);
+  const url = `https://graph.microsoft.com/v1.0/sites/${cleanHost}:${cleanPath}`;
+  const data = await callGraphGet<{ id: string; name?: string; webUrl?: string }>(url);
+  if (data?.id) {
+    lastResolvedSite = { id: data.id, name: data.name, webUrl: data.webUrl };
+    return data.id;
   }
 
   throw new GraphError(
     404,
-    `Site ou biblioteca não encontrados. Verifique a configuração (${cleanHost}${cleanPath}).`
+    `Site '${cleanHost}:${cleanPath}' não foi encontrado no Microsoft Graph.`
   );
 }
 
@@ -412,6 +404,28 @@ export async function encontrarBibliotecaDriveId(siteId: string): Promise<string
         console.warn("Erro ao obter drive da lista encontrada:", err.message);
       }
     }
+
+    // Se não encontrou pelo nome exato, tenta listas contendo 'projet' ou 'document'
+    for (const l of lists) {
+      const dLow = (l.displayName || "").toLowerCase();
+      const nLow = (l.name || "").toLowerCase();
+      if (
+        dLow.includes("projet") ||
+        dLow.includes("document") ||
+        nLow.includes("projet") ||
+        nLow.includes("document")
+      ) {
+        try {
+          const lDriveUrl = `https://graph.microsoft.com/v1.0/sites/${siteId}/lists/${l.id}/drive`;
+          const lDriveData = await callGraphGet<{ id: string; name?: string; webUrl?: string }>(lDriveUrl);
+          if (lDriveData?.id) {
+            return lDriveData.id;
+          }
+        } catch {
+          // Continua
+        }
+      }
+    }
   }
 
   // 7. Se houver apenas 1 drive acessível retornado, utiliza-o
@@ -420,9 +434,15 @@ export async function encontrarBibliotecaDriveId(siteId: string): Promise<string
     return drives[0].id;
   }
 
+  const siteInfo = lastResolvedSite;
+  const siteDesc = siteInfo?.webUrl
+    ? `Site conectado: "${siteInfo.name || "Site"}" (${siteInfo.webUrl})`
+    : `Site ID: ${siteId}`;
+
   const driveNames = drives.map((d) => d.name || "(sem nome)").join(", ");
   const listNames = lists.map((l) => l.displayName || l.name || "(sem nome)").join(", ");
   const detalhe = [
+    siteDesc,
     driveNames ? `Drives retornados: [${driveNames}]` : "Drives vieram vazios",
     listNames ? `Listas retornadas: [${listNames}]` : "Listas vieram vazias",
   ].join(". ");
@@ -467,10 +487,24 @@ export async function carregarProximosItensSharePoint(
 }
 
 /**
- * 5. Baixar o arquivo escolhido:
+ * 5. Busca o conteúdo binário de um arquivo no SharePoint via Microsoft Graph,
+ * mantendo o conteúdo SOMENTE em memória como Blob/File:
  * GET https://graph.microsoft.com/v1.0/drives/{drive-id}/items/{item-id}/content
- * Retorna o conteúdo binário como Blob.
+ * com header Authorization: Bearer <token>
+ * Lê a resposta com response.blob() e cria um objeto File em memória (new File([blob], nome, { type })).
  */
+export async function obterArquivoSharePointEmMemoria(
+  driveId: string,
+  itemId: string,
+  fileName: string,
+  mimeTypeHint?: string
+): Promise<File> {
+  const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`;
+  const blob = await callGraphGet<Blob>(url, "blob");
+  const type = blob.type || mimeTypeHint || "application/octet-stream";
+  return new File([blob], fileName, { type });
+}
+
 export async function baixarArquivoSharePoint(
   driveId: string,
   itemId: string

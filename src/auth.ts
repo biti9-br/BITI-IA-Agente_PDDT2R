@@ -1,6 +1,4 @@
 import {
-  createUserWithEmailAndPassword,
-  signInWithEmailAndPassword,
   signOut,
   onAuthStateChanged,
   OAuthProvider,
@@ -8,24 +6,14 @@ import {
   signInWithRedirect,
   getRedirectResult,
   reauthenticateWithPopup,
-  linkWithCredential,
   type User,
 } from "firebase/auth";
 import { auth } from "./firebase";
 
-export interface CorporateUser {
-  uid: string;
-  email: string;
-  displayName: string;
-  photoURL?: string | null;
-  providerId: string;
-}
-
 // Armazenamento do token SOMENTE em memória durante o ciclo de vida da aplicação.
 // NUNCA salvo em localStorage, sessionStorage ou cookies.
 let inMemoryAccessToken: string | null = null;
-let corporateSessionUser: CorporateUser | null = null;
-const authListeners: Array<(user: User | CorporateUser | null) => void> = [];
+let ultimoMotivoLogout: string | null = null;
 
 export function setMemoryToken(token: string | null): void {
   inMemoryAccessToken = token;
@@ -35,14 +23,94 @@ export function getMemoryToken(): string | null {
   return inMemoryAccessToken;
 }
 
-function emitirMudancaAuth(user: User | CorporateUser | null) {
-  for (const listener of authListeners) {
+/**
+ * 1. MOTIVO VISÍVEL
+ * Registra o motivo de encerramento da sessão para exibição transparente na tela de login.
+ */
+export function registrarMotivoLogout(motivo: string): void {
+  ultimoMotivoLogout = motivo;
+  if (typeof sessionStorage !== "undefined") {
     try {
-      listener(user);
-    } catch (e) {
-      console.error("Erro no listener de auth:", e);
+      sessionStorage.setItem("biti9_logout_reason", motivo);
+    } catch {}
+  }
+}
+
+export function obterMotivoLogout(): string | null {
+  if (ultimoMotivoLogout) {
+    return ultimoMotivoLogout;
+  }
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      return sessionStorage.getItem("biti9_logout_reason");
+    } catch {}
+  }
+  return null;
+}
+
+export function limparMotivoLogout(): void {
+  ultimoMotivoLogout = null;
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      sessionStorage.removeItem("biti9_logout_reason");
+    } catch {}
+  }
+}
+
+/**
+ * 2. E-MAIL
+ * Obtenha o e-mail nesta ordem estrita:
+ * 1. user.email
+ * 2. user.providerData[0].email
+ * 3. claim "email" do ID token
+ * 4. claim "preferred_username" do token da Microsoft
+ * 
+ * Retorna sempre em minúsculas e sem espaços ao redor.
+ */
+export async function extrairEmailUsuario(user: User | null): Promise<string> {
+  if (!user) return "";
+
+  // 1. user.email
+  if (user.email && user.email.trim()) {
+    return user.email.trim().toLowerCase();
+  }
+
+  // 2. user.providerData[0].email (ou outros providers)
+  if (user.providerData && user.providerData.length > 0) {
+    for (const provider of user.providerData) {
+      if (provider.email && provider.email.trim()) {
+        return provider.email.trim().toLowerCase();
+      }
     }
   }
+
+  // 3. claim "email" do ID token e 4. claim "preferred_username" do token da Microsoft
+  try {
+    const tokenResult = await user.getIdTokenResult();
+    const claims = tokenResult.claims;
+
+    // 3. claim "email"
+    if (typeof claims.email === "string" && claims.email.trim()) {
+      return claims.email.trim().toLowerCase();
+    }
+
+    // 4. claim "preferred_username"
+    if (typeof claims.preferred_username === "string" && claims.preferred_username.trim()) {
+      return claims.preferred_username.trim().toLowerCase();
+    }
+
+    // Claims complementares do Azure AD / Microsoft Entra
+    if (typeof (claims as any).upn === "string" && (claims as any).upn.trim()) {
+      return (claims as any).upn.trim().toLowerCase();
+    }
+    if (typeof (claims as any).unique_name === "string" && (claims as any).unique_name.trim()) {
+      return (claims as any).unique_name.trim().toLowerCase();
+    }
+  } catch (err) {
+    console.warn("[extrairEmailUsuario] Falha ao extrair claims do ID token:", err);
+  }
+
+  return "";
 }
 
 // Configuração do provedor Microsoft com escopo Sites.Selected e tenant corporativo
@@ -56,15 +124,11 @@ export function criarMicrosoftProvider(): OAuthProvider {
   return provider;
 }
 
-export function cadastrar(email: string, senha: string) {
-  return createUserWithEmailAndPassword(auth, email, senha);
-}
-
-export function login(email: string, senha: string) {
-  return signInWithEmailAndPassword(auth, email, senha);
-}
-
-export async function loginComMicrosoft(passwordHint?: string) {
+/**
+ * Login oficial via Microsoft com Firebase Auth.
+ * O usuário logado no app vem exclusivamente do Firebase.
+ */
+export async function loginComMicrosoft() {
   const provider = criarMicrosoftProvider();
   
   try {
@@ -73,83 +137,8 @@ export async function loginComMicrosoft(passwordHint?: string) {
     if (credential?.accessToken) {
       setMemoryToken(credential.accessToken);
     }
-    corporateSessionUser = null;
     return result;
   } catch (popupErr: any) {
-    // Trata caso a conta já exista com credencial de senha/outro provedor
-    // Permitindo acesso transparente para quem já tem senha cadastrada
-    if (popupErr.code === "auth/account-exists-with-different-credential") {
-      const pendingCred = OAuthProvider.credentialFromError(popupErr);
-      const email = (popupErr.customData?.email || (popupErr as any).email || "").toLowerCase().trim();
-
-      if (pendingCred) {
-        const token = (pendingCred as any).accessToken;
-        if (token) {
-          setMemoryToken(token);
-        }
-
-        // Tenta decodificar o idToken para obter nome e identificador da conta Microsoft
-        let displayName = email.split("@")[0] || "Colaborador";
-        let uid = `ms_${email}`;
-        if ((pendingCred as any).idToken) {
-          try {
-            const base64Url = (pendingCred as any).idToken.split(".")[1];
-            const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
-            const jsonPayload = decodeURIComponent(
-              atob(base64)
-                .split("")
-                .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-                .join("")
-            );
-            const decoded = JSON.parse(jsonPayload);
-            if (decoded.name) displayName = decoded.name;
-            if (decoded.oid) uid = decoded.oid;
-            else if (decoded.sub) uid = decoded.sub;
-          } catch {
-            // Decodificação opcional
-          }
-        }
-
-        // Se uma senha foi informada, tenta linkar as credenciais no Firebase
-        if (passwordHint) {
-          try {
-            const userCred = await signInWithEmailAndPassword(auth, email, passwordHint);
-            const linkResult = await linkWithCredential(userCred.user, pendingCred);
-            const cred = OAuthProvider.credentialFromResult(linkResult);
-            if (cred?.accessToken) {
-              setMemoryToken(cred.accessToken);
-            }
-            corporateSessionUser = null;
-            return linkResult;
-          } catch {
-            // Continua com a autenticação corporativa direta
-          }
-        }
-
-        // Validação de segurança: apenas e-mails @biti9.com.br
-        if (!email.endsWith("@biti9.com.br")) {
-          throw new Error(`Acesso restrito: A conta Microsoft "${email}" não pertence ao domínio @biti9.com.br.`);
-        }
-
-        // Cria a sessão autenticada corporativa
-        const corpUser: CorporateUser = {
-          uid,
-          email,
-          displayName,
-          photoURL: null,
-          providerId: "microsoft.com",
-        };
-        corporateSessionUser = corpUser;
-        emitirMudancaAuth(corpUser);
-
-        return {
-          user: corpUser as unknown as User,
-          providerId: "microsoft.com",
-          operationType: "signIn",
-        };
-      }
-    }
-
     const isInIframe = typeof window !== "undefined" && window.self !== window.top;
     if (!isInIframe && (popupErr.code === "auth/popup-blocked" || popupErr.code === "auth/popup-closed-by-user")) {
       return await signInWithRedirect(auth, provider);
@@ -163,10 +152,18 @@ export function loginComMicrosoftRedirect() {
   return signInWithRedirect(auth, provider);
 }
 
-// Reautenticação sob demanda (usada em caso de erro 401 ou token ausente)
+/**
+ * Reautenticação sob demanda com o Microsoft Graph via reauthenticateWithPopup.
+ * Usada pelo navegador do SharePoint quando o token do Graph não estiver em memória
+ * (por exemplo, após recarregar a página com F5), SEM deslogar o usuário do Firebase.
+ */
 export async function reautenticarMicrosoft(): Promise<string> {
   const provider = criarMicrosoftProvider();
+  if (typeof auth.authStateReady === "function") {
+    await auth.authStateReady();
+  }
 
+  // Se o usuário está logado no Firebase, reautentica sem deslogar
   if (auth.currentUser) {
     try {
       const result = await reauthenticateWithPopup(auth.currentUser, provider);
@@ -176,31 +173,49 @@ export async function reautenticarMicrosoft(): Promise<string> {
         return credential.accessToken;
       }
     } catch (reauthErr: any) {
-      if (reauthErr.code === "auth/account-exists-with-different-credential") {
-        const cred = OAuthProvider.credentialFromError(reauthErr);
+      if (reauthErr.code === "auth/popup-closed-by-user" || reauthErr.code === "auth/cancelled-popup-request") {
+        throw new Error("Janela de autenticação cancelada pelo usuário.");
+      }
+      if (reauthErr.code === "auth/popup-blocked") {
+        throw new Error("Pop-up bloqueado pelo navegador. Ative as permissões de pop-up para conectar ao SharePoint.");
+      }
+      console.warn("[reautenticarMicrosoft] reauthenticateWithPopup falhou, tentando signInWithPopup como fallback:", reauthErr);
+      
+      try {
+        const signInResult = await signInWithPopup(auth, provider);
+        const cred = OAuthProvider.credentialFromResult(signInResult);
         if (cred?.accessToken) {
           setMemoryToken(cred.accessToken);
           return cred.accessToken;
         }
+      } catch (signInErr: any) {
+        if (signInErr.code === "auth/popup-closed-by-user" || signInErr.code === "auth/cancelled-popup-request") {
+          throw new Error("Janela de autenticação cancelada pelo usuário.");
+        }
+        if (signInErr.code === "auth/popup-blocked") {
+          throw new Error("Pop-up bloqueado pelo navegador. Ative as permissões de pop-up para conectar ao SharePoint.");
+        }
+        throw signInErr;
       }
     }
-  }
-
-  // Se não houver auth.currentUser ou se estiver em sessão corporativa delegada:
-  try {
-    const result = await signInWithPopup(auth, provider);
-    const credential = OAuthProvider.credentialFromResult(result);
-    if (credential?.accessToken) {
-      setMemoryToken(credential.accessToken);
-      return credential.accessToken;
+  } else {
+    // Se não há usuário no Firebase, faz login via popup
+    try {
+      const result = await signInWithPopup(auth, provider);
+      const credential = OAuthProvider.credentialFromResult(result);
+      if (credential?.accessToken) {
+        setMemoryToken(credential.accessToken);
+        return credential.accessToken;
+      }
+    } catch (popupErr: any) {
+      if (popupErr.code === "auth/popup-closed-by-user" || popupErr.code === "auth/cancelled-popup-request") {
+        throw new Error("Janela de autenticação cancelada pelo usuário.");
+      }
+      if (popupErr.code === "auth/popup-blocked") {
+        throw new Error("Pop-up bloqueado pelo navegador. Ative as permissões de pop-up para conectar ao SharePoint.");
+      }
+      throw popupErr;
     }
-  } catch (popupErr: any) {
-    const cred = OAuthProvider.credentialFromError(popupErr);
-    if (cred?.accessToken) {
-      setMemoryToken(cred.accessToken);
-      return cred.accessToken;
-    }
-    throw new Error("Sua sessão expirou. Entre novamente.");
   }
 
   throw new Error("Não foi possível obter o token de acesso da Microsoft.");
@@ -218,82 +233,27 @@ export async function verificarResultadoRedirect() {
     }
     return result;
   } catch (err: any) {
-    if (err.code === "auth/account-exists-with-different-credential") {
-      const pendingCred = OAuthProvider.credentialFromError(err);
-      const email = (err.customData?.email || (err as any).email || "").toLowerCase().trim();
-      if (pendingCred && email && email.endsWith("@biti9.com.br")) {
-        const token = (pendingCred as any).accessToken;
-        if (token) {
-          setMemoryToken(token);
-        }
-        let displayName = email.split("@")[0] || "Colaborador";
-        let uid = `ms_${email}`;
-        if ((pendingCred as any).idToken) {
-          try {
-            const base64Url = (pendingCred as any).idToken.split(".")[1];
-            const base64 = base64Url.replace(/-/g, "+").replace(/_/g, "/");
-            const jsonPayload = decodeURIComponent(
-              atob(base64)
-                .split("")
-                .map((c) => "%" + ("00" + c.charCodeAt(0).toString(16)).slice(-2))
-                .join("")
-            );
-            const decoded = JSON.parse(jsonPayload);
-            if (decoded.name) displayName = decoded.name;
-            if (decoded.oid) uid = decoded.oid;
-          } catch {}
-        }
-        const corpUser: CorporateUser = {
-          uid,
-          email,
-          displayName,
-          photoURL: null,
-          providerId: "microsoft.com",
-        };
-        corporateSessionUser = corpUser;
-        emitirMudancaAuth(corpUser);
-        return {
-          user: corpUser as unknown as User,
-          providerId: "microsoft.com",
-          operationType: "signIn",
-        };
-      }
-    }
-    throw err;
+    console.warn("[Redirect Result]", err);
+    return null;
   }
 }
 
-export async function logout() {
+/**
+ * 3. NÃO DESLOGAR POR ERRO DE API
+ * Único motivo para signOut() automático: e-mail fora do domínio @biti9.com.br.
+ */
+export async function logout(motivo?: string) {
+  if (motivo) {
+    registrarMotivoLogout(motivo);
+  }
   setMemoryToken(null);
-  corporateSessionUser = null;
-  emitirMudancaAuth(null);
   await signOut(auth);
 }
 
-export function observarUsuario(callback: (user: User | CorporateUser | null) => void) {
-  authListeners.push(callback);
-
-  // Notifica o estado inicial se já houver sessão corporativa
-  if (corporateSessionUser) {
-    callback(corporateSessionUser);
-  }
-
-  const unsubscribe = onAuthStateChanged(auth, (fbUser) => {
-    if (fbUser) {
-      corporateSessionUser = null;
-      callback(fbUser);
-    } else if (corporateSessionUser) {
-      callback(corporateSessionUser);
-    } else {
-      callback(null);
-    }
-  });
-
-  return () => {
-    const idx = authListeners.indexOf(callback);
-    if (idx !== -1) {
-      authListeners.splice(idx, 1);
-    }
-    unsubscribe();
-  };
+/**
+ * Observador oficial do Firebase Auth.
+ * O estado "usuário logado" vem exclusivamente de onAuthStateChanged.
+ */
+export function observarUsuario(callback: (user: User | null) => void) {
+  return onAuthStateChanged(auth, callback);
 }

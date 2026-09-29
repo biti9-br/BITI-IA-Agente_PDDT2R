@@ -1,5 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { ClientGroup } from "../types";
+import { apiFetch } from "../services/api";
 
 export interface DbStatusState {
   mode: "real" | "demo";
@@ -32,6 +33,11 @@ export function useDbStatus(userEmail: string) {
 
   // Carrega status e arquivos do Banco de Vetores para a conversa ativa
   const loadDbStatus = useCallback(async (targetSessionId?: string) => {
+    if (!userEmail) {
+      // Usuário não autenticado: não executa chamada para evitar erro de autorização
+      return;
+    }
+
     const sessId = targetSessionId || activeSessionId;
 
     // Cancela requisição anterior se houver para evitar sobrescrever com dados antigos
@@ -53,8 +59,7 @@ export function useDbStatus(userEmail: string) {
     setLoading(true);
 
     try {
-      const emailParam = `?email=${encodeURIComponent(userEmail)}`;
-      const res = await fetch(`/api/conversations/${encodeURIComponent(sessId)}/sources${emailParam}`, {
+      const res = await apiFetch(`/api/conversations/${encodeURIComponent(sessId)}/sources`, {
         signal: controller.signal
       });
 
@@ -77,6 +82,9 @@ export function useDbStatus(userEmail: string) {
         // Ignorar requisições abortadas ao alternar rapidamente entre conversas
         return;
       }
+      if (e?.message?.includes("Usuário não autenticado") || !userEmail) {
+        return;
+      }
       console.error("Erro ao carregar dados do banco de dados", e);
     } finally {
       if (abortControllerRef.current === controller) {
@@ -86,13 +94,27 @@ export function useDbStatus(userEmail: string) {
   }, [activeSessionId, userEmail]);
 
   useEffect(() => {
+    if (!userEmail) {
+      setDbStatus({
+        mode: "demo",
+        rootFolderId: "",
+        rootFolderName: "",
+        fileCount: 0,
+        chunkCount: 0,
+        clientGroups: []
+      });
+      setSelectedFileIds([]);
+      setLoading(false);
+      return;
+    }
+
     loadDbStatus(activeSessionId);
     return () => {
       if (abortControllerRef.current) {
         abortControllerRef.current.abort();
       }
     };
-  }, [activeSessionId, loadDbStatus]);
+  }, [activeSessionId, loadDbStatus, userEmail]);
 
   const handleSessionChange = useCallback((newSessionId: string) => {
     setDbStatus(prev => ({
@@ -104,8 +126,10 @@ export function useDbStatus(userEmail: string) {
     setSelectedFileIds([]);
     setActiveSessionId(newSessionId);
     localStorage.setItem("biti9_active_session_id", newSessionId);
-    loadDbStatus(newSessionId);
-  }, [loadDbStatus]);
+    if (userEmail) {
+      loadDbStatus(newSessionId);
+    }
+  }, [loadDbStatus, userEmail]);
 
   // Sincroniza selectedFileIds para marcar fontes no primeiro load e gerenciar novos uploads/deleções
   useEffect(() => {
