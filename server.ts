@@ -1,4 +1,5 @@
 import express from "express";
+import http from "http";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
@@ -44,6 +45,7 @@ try {
 
 // 2. SERVIDOR COM ADMIN SDK: Todas as operações de Firestore do servidor usam firebase-admin/firestore
 const firestoreDb = getAdminFirestore(adminApp);
+firestoreDb.settings({ ignoreUndefinedProperties: true });
 const adminAuth = getAdminAuth(adminApp);
 
 // Carga inicial do tipo PDD com os critérios corporativos
@@ -329,7 +331,7 @@ declare global {
 }
 
 const app = express();
-const PORT = 3000;
+const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 
 // Permite receber dados maiores, como tokens ou PDFs em base64
 app.use(express.json({ limit: '100mb' }));
@@ -557,7 +559,16 @@ async function saveChunksBatch(userEmail: string, chunks: VectorChunk[]): Promis
     for (const chunk of slice) {
       const chunkDocRef = doc(firestoreDb, `users/${userEmailKey}/chunks/${chunk.id}`);
       const dataToSave: any = {
-        ...chunk,
+        id: chunk.id,
+        fileId: chunk.fileId,
+        conversationId: chunk.conversationId,
+        fileName: chunk.fileName,
+        clientId: chunk.clientId,
+        clientName: chunk.clientName,
+        robotId: chunk.robotId,
+        robotName: chunk.robotName,
+        text: chunk.text,
+        secao: chunk.secao || "",
         embeddingModelo: chunk.embeddingModelo || EMBEDDING_MODEL,
         embeddingDim: chunk.embeddingDim || 768
       };
@@ -566,6 +577,11 @@ async function saveChunksBatch(userEmail: string, chunks: VectorChunk[]): Promis
           dataToSave.embedding = FieldValue.vector(chunk.embedding);
         } else if ((chunk.embedding as any).constructor?.name === "VectorValue") {
           dataToSave.embedding = chunk.embedding;
+        }
+      }
+      for (const k of Object.keys(dataToSave)) {
+        if (dataToSave[k] === undefined) {
+          delete dataToSave[k];
         }
       }
       batch.set(chunkDocRef, dataToSave);
@@ -2967,28 +2983,57 @@ app.post("/api/db/add-source", async (req, res) => {
 
     if (existingOtherConv && existingOtherConv.formatoConteudo === "markdown") {
       console.log(`[Reaproveitamento] Checksum ${checksum} já existe na conversa ${existingOtherConv.conversationId} com formato Markdown. Reaproveitando sem chamadas ao Gemini.`);
-      const allOtherChunks = await getUserChunks(resolvedUserEmail, existingOtherConv.conversationId);
-      const existingChunks = allOtherChunks.filter(c => c.fileId === existingOtherConv.fileId);
+      
+      const userEmailKey = getUserEmailKey(resolvedUserEmail);
+      // Busca os chunks originais diretamente com o embedding preservado
+      const origChunksSnap = await firestoreDb.collection(`users/${userEmailKey}/chunks`)
+        .where("fileId", "==", existingOtherConv.fileId)
+        .get();
 
-      const newChunks: VectorChunk[] = existingChunks.map((c, idx) => ({
-        id: `${fileId}_chunk_${idx}`,
-        fileId,
-        conversationId: targetConversationId,
-        fileName: name,
-        clientId,
-        clientName,
-        robotId,
-        robotName,
-        text: c.text,
-        secao: c.secao,
-        embedding: c.embedding ? [...c.embedding] : undefined,
-        embeddingModelo: c.embeddingModelo || EMBEDDING_MODEL,
-        embeddingDim: c.embeddingDim || 768
-      }));
+      let existingChunks: any[] = [];
+      if (!origChunksSnap.empty) {
+        existingChunks = origChunksSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+      } else {
+        const allOtherChunks = await getUserChunks(resolvedUserEmail, existingOtherConv.conversationId);
+        existingChunks = allOtherChunks.filter(c => c.fileId === existingOtherConv.fileId);
+      }
+
+      const ai = getGeminiClient();
+      const newChunks: VectorChunk[] = [];
+      for (let idx = 0; idx < existingChunks.length; idx++) {
+        const c = existingChunks[idx];
+        let emb = c.embedding;
+        if (!emb || (!Array.isArray(emb) && (emb as any).constructor?.name !== "VectorValue")) {
+          try {
+            emb = await getEmbeddingWithCache(ai, c.text, resolvedUserEmail, "RETRIEVAL_DOCUMENT");
+          } catch (e) {
+            console.warn(`[Reaproveitamento] Aviso ao carregar embedding do cache para chunk #${idx}:`, e);
+          }
+        }
+
+        const chunkObj: VectorChunk = {
+          id: `${fileId}_chunk_${idx}`,
+          fileId,
+          conversationId: targetConversationId,
+          fileName: name,
+          clientId,
+          clientName,
+          robotId,
+          robotName,
+          text: c.text,
+          secao: c.secao || "",
+          embeddingModelo: c.embeddingModelo || EMBEDDING_MODEL,
+          embeddingDim: c.embeddingDim || 768
+        };
+        if (emb) {
+          chunkObj.embedding = emb;
+        }
+        newChunks.push(chunkObj);
+      }
 
       const existingContent = await getMarkdownContent(resolvedUserEmail, existingOtherConv.fileId);
 
-      const fileMeta = {
+      const fileMeta: any = {
         fileId,
         conversationId: targetConversationId,
         fileName: name,
@@ -3001,16 +3046,18 @@ app.post("/api/db/add-source", async (req, res) => {
         chunkCount: newChunks.length,
         indexedAt: new Date().toISOString(),
         origin: origin || existingOtherConv.origin || "Arquivo local",
-        folderPath: folderPath || existingOtherConv.folderPath || undefined,
         originalName: originalName || name,
         checksum,
-        tipoDocumento: existingOtherConv.tipoDocumento,
-        confiancaValidacao: existingOtherConv.confiancaValidacao,
-        justificativaValidacao: existingOtherConv.justificativaValidacao,
+        tipoDocumento: existingOtherConv.tipoDocumento || "PDD",
+        confiancaValidacao: existingOtherConv.confiancaValidacao || 100,
+        justificativaValidacao: existingOtherConv.justificativaValidacao || "Documento reaproveitado de outra conversa.",
         formatoConteudo: "markdown",
         versaoConversor: 2,
         status: "concluido"
       };
+      if (folderPath || existingOtherConv.folderPath) {
+        fileMeta.folderPath = folderPath || existingOtherConv.folderPath;
+      }
 
       await saveFileMetadata(resolvedUserEmail, fileMeta);
       await saveChunksBatch(resolvedUserEmail, newChunks);
@@ -4116,12 +4163,14 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
 
 // Setup do Vite e do servidor Express
 async function startServer() {
+  const httpServer = http.createServer(app);
+
   // Vite em desenvolvimento
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
       server: { 
         middlewareMode: true,
-        hmr: process.env.DISABLE_HMR !== "true"
+        hmr: process.env.DISABLE_HMR === "true" ? false : { server: httpServer }
       },
       appType: "spa"
     });
@@ -4135,7 +4184,7 @@ async function startServer() {
     });
   }
 
-  app.listen(PORT, "0.0.0.0", () => {
+  httpServer.listen(PORT, "0.0.0.0", () => {
     console.log(`[biti9 Server] Rodando com sucesso na porta ${PORT}`);
   });
 }
