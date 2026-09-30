@@ -641,9 +641,18 @@ export default function SharePointBrowserModal({
                   Para navegar nas pastas dos projetos e importar documentos diretamente do SharePoint da BITI9, conecte sua conta Microsoft.
                 </p>
                 {error && (
-                  <p className="text-xs text-rose-500 mt-2 font-medium bg-rose-500/10 p-2 rounded-lg border border-rose-500/20">
-                    {error}
-                  </p>
+                  <div className="mt-3 p-3 rounded-xl bg-rose-500/10 border border-rose-500/20 text-xs text-rose-500 text-left space-y-1">
+                    <div className="font-semibold flex items-center gap-1.5">
+                      <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                      <span>Aviso de Conexão</span>
+                    </div>
+                    <p className="leading-relaxed">{error}</p>
+                    {error.includes("não está autorizado") && (
+                      <p className="text-[11px] text-[var(--cor-texto-secundario)] pt-1 border-t border-rose-500/20">
+                        Dica: Acesse <strong>Firebase Console &gt; Authentication &gt; Settings &gt; Authorized domains</strong> e adicione o domínio ou IP exibido acima.
+                      </p>
+                    )}
+                  </div>
                 )}
               </div>
               <button

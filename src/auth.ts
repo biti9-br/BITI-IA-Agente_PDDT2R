@@ -10,17 +10,68 @@ import {
 } from "firebase/auth";
 import { auth } from "./firebase";
 
-// Armazenamento do token SOMENTE em memória durante o ciclo de vida da aplicação.
-// NUNCA salvo em localStorage, sessionStorage ou cookies.
+// Armazenamento do token em memória, sessionStorage e localStorage com tolerância a reload (F5)
+const SESSION_MS_TOKEN_KEY = "biti9_ms_graph_token";
+const SESSION_MS_TOKEN_TIME_KEY = "biti9_ms_graph_token_time";
 let inMemoryAccessToken: string | null = null;
 let ultimoMotivoLogout: string | null = null;
 
 export function setMemoryToken(token: string | null): void {
   inMemoryAccessToken = token;
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      if (token) {
+        sessionStorage.setItem(SESSION_MS_TOKEN_KEY, token);
+      } else {
+        sessionStorage.removeItem(SESSION_MS_TOKEN_KEY);
+      }
+    } catch {}
+  }
+  if (typeof localStorage !== "undefined") {
+    try {
+      if (token) {
+        localStorage.setItem(SESSION_MS_TOKEN_KEY, token);
+        localStorage.setItem(SESSION_MS_TOKEN_TIME_KEY, String(Date.now()));
+      } else {
+        localStorage.removeItem(SESSION_MS_TOKEN_KEY);
+        localStorage.removeItem(SESSION_MS_TOKEN_TIME_KEY);
+      }
+    } catch {}
+  }
 }
 
 export function getMemoryToken(): string | null {
-  return inMemoryAccessToken;
+  if (inMemoryAccessToken) return inMemoryAccessToken;
+  if (typeof sessionStorage !== "undefined") {
+    try {
+      const saved = sessionStorage.getItem(SESSION_MS_TOKEN_KEY);
+      if (saved) {
+        inMemoryAccessToken = saved;
+        return saved;
+      }
+    } catch {}
+  }
+  if (typeof localStorage !== "undefined") {
+    try {
+      const saved = localStorage.getItem(SESSION_MS_TOKEN_KEY);
+      const savedTime = localStorage.getItem(SESSION_MS_TOKEN_TIME_KEY);
+      // Tokens da Microsoft expiram em 3600 segundos (1 hora). Usamos tolerância de 55 minutos.
+      if (saved && savedTime) {
+        const ageMs = Date.now() - Number(savedTime);
+        if (ageMs < 55 * 60 * 1000) {
+          inMemoryAccessToken = saved;
+          return saved;
+        } else {
+          localStorage.removeItem(SESSION_MS_TOKEN_KEY);
+          localStorage.removeItem(SESSION_MS_TOKEN_TIME_KEY);
+        }
+      } else if (saved) {
+        inMemoryAccessToken = saved;
+        return saved;
+      }
+    } catch {}
+  }
+  return null;
 }
 
 /**
@@ -121,7 +172,28 @@ export function criarMicrosoftProvider(): OAuthProvider {
     prompt: "select_account",
   });
   provider.addScope("Sites.Selected");
+  provider.addScope("User.Read");
+  provider.addScope("offline_access");
   return provider;
+}
+
+function formatAuthError(err: any): Error {
+  const code = err?.code || "";
+  const msg = err?.message || String(err);
+  if (code === "auth/popup-closed-by-user" || code === "auth/cancelled-popup-request") {
+    return new Error("Janela de autenticação cancelada pelo usuário.");
+  }
+  if (code === "auth/popup-blocked") {
+    return new Error("Pop-up bloqueado pelo navegador. Por favor, ative as permissões de pop-up nas configurações do navegador para conectar ao SharePoint.");
+  }
+  if (code === "auth/unauthorized-domain") {
+    const host = typeof window !== "undefined" ? window.location.hostname : "produção";
+    return new Error(`O domínio "${host}" não está autorizado no Firebase Authentication. Para liberar o acesso em produção, adicione "${host}" no Firebase Console (Authentication > Configurações > Domínios autorizados).`);
+  }
+  if (code === "auth/network-request-failed") {
+    return new Error("Falha de conexão com os serviços de autenticação. Verifique sua conexão com a internet.");
+  }
+  return new Error(msg);
 }
 
 /**
@@ -134,8 +206,13 @@ export async function loginComMicrosoft() {
   try {
     const result = await signInWithPopup(auth, provider);
     const credential = OAuthProvider.credentialFromResult(result);
-    if (credential?.accessToken) {
-      setMemoryToken(credential.accessToken);
+    const token =
+      credential?.accessToken ||
+      (result as any)?._tokenResponse?.oauthAccessToken ||
+      (result as any)?._tokenResponse?.accessToken ||
+      null;
+    if (token) {
+      setMemoryToken(token);
     }
     return result;
   } catch (popupErr: any) {
@@ -143,7 +220,7 @@ export async function loginComMicrosoft() {
     if (!isInIframe && (popupErr.code === "auth/popup-blocked" || popupErr.code === "auth/popup-closed-by-user")) {
       return await signInWithRedirect(auth, provider);
     }
-    throw popupErr;
+    throw formatAuthError(popupErr);
   }
 }
 
@@ -153,72 +230,56 @@ export function loginComMicrosoftRedirect() {
 }
 
 /**
- * Reautenticação sob demanda com o Microsoft Graph via reauthenticateWithPopup.
- * Usada pelo navegador do SharePoint quando o token do Graph não estiver em memória
- * (por exemplo, após recarregar a página com F5), SEM deslogar o usuário do Firebase.
+ * Reautenticação sob demanda com o Microsoft Graph via popup.
+ * Usada pelo navegador do SharePoint quando o token do Graph não estiver em memória/sessão,
+ * SEM deslogar o usuário do Firebase.
  */
 export async function reautenticarMicrosoft(): Promise<string> {
   const provider = criarMicrosoftProvider();
-  if (typeof auth.authStateReady === "function") {
-    await auth.authStateReady();
-  }
 
-  // Se o usuário está logado no Firebase, reautentica sem deslogar
+  // 1. Se o usuário já está autenticado no Firebase, tenta reauthenticateWithPopup diretamente
   if (auth.currentUser) {
     try {
-      const result = await reauthenticateWithPopup(auth.currentUser, provider);
-      const credential = OAuthProvider.credentialFromResult(result);
-      if (credential?.accessToken) {
-        setMemoryToken(credential.accessToken);
-        return credential.accessToken;
+      const reauthResult = await reauthenticateWithPopup(auth.currentUser, provider);
+      const cred = OAuthProvider.credentialFromResult(reauthResult);
+      const token =
+        cred?.accessToken ||
+        (reauthResult as any)?._tokenResponse?.oauthAccessToken ||
+        (reauthResult as any)?._tokenResponse?.accessToken ||
+        null;
+      if (token) {
+        setMemoryToken(token);
+        return token;
       }
     } catch (reauthErr: any) {
-      if (reauthErr.code === "auth/popup-closed-by-user" || reauthErr.code === "auth/cancelled-popup-request") {
-        throw new Error("Janela de autenticação cancelada pelo usuário.");
+      console.warn("[reautenticarMicrosoft] reauthenticateWithPopup falhou, tentando fallback com signInWithPopup:", reauthErr);
+      if (
+        reauthErr.code === "auth/unauthorized-domain" ||
+        reauthErr.code === "auth/popup-blocked"
+      ) {
+        throw formatAuthError(reauthErr);
       }
-      if (reauthErr.code === "auth/popup-blocked") {
-        throw new Error("Pop-up bloqueado pelo navegador. Ative as permissões de pop-up para conectar ao SharePoint.");
-      }
-      console.warn("[reautenticarMicrosoft] reauthenticateWithPopup falhou, tentando signInWithPopup como fallback:", reauthErr);
-      
-      try {
-        const signInResult = await signInWithPopup(auth, provider);
-        const cred = OAuthProvider.credentialFromResult(signInResult);
-        if (cred?.accessToken) {
-          setMemoryToken(cred.accessToken);
-          return cred.accessToken;
-        }
-      } catch (signInErr: any) {
-        if (signInErr.code === "auth/popup-closed-by-user" || signInErr.code === "auth/cancelled-popup-request") {
-          throw new Error("Janela de autenticação cancelada pelo usuário.");
-        }
-        if (signInErr.code === "auth/popup-blocked") {
-          throw new Error("Pop-up bloqueado pelo navegador. Ative as permissões de pop-up para conectar ao SharePoint.");
-        }
-        throw signInErr;
-      }
-    }
-  } else {
-    // Se não há usuário no Firebase, faz login via popup
-    try {
-      const result = await signInWithPopup(auth, provider);
-      const credential = OAuthProvider.credentialFromResult(result);
-      if (credential?.accessToken) {
-        setMemoryToken(credential.accessToken);
-        return credential.accessToken;
-      }
-    } catch (popupErr: any) {
-      if (popupErr.code === "auth/popup-closed-by-user" || popupErr.code === "auth/cancelled-popup-request") {
-        throw new Error("Janela de autenticação cancelada pelo usuário.");
-      }
-      if (popupErr.code === "auth/popup-blocked") {
-        throw new Error("Pop-up bloqueado pelo navegador. Ative as permissões de pop-up para conectar ao SharePoint.");
-      }
-      throw popupErr;
     }
   }
 
-  throw new Error("Não foi possível obter o token de acesso da Microsoft.");
+  // 2. Fallback com signInWithPopup (preserva o usuário e obtém as credenciais do provedor)
+  try {
+    const result = await signInWithPopup(auth, provider);
+    const credential = OAuthProvider.credentialFromResult(result);
+    const token =
+      credential?.accessToken ||
+      (result as any)?._tokenResponse?.oauthAccessToken ||
+      (result as any)?._tokenResponse?.accessToken ||
+      null;
+    if (token) {
+      setMemoryToken(token);
+      return token;
+    }
+  } catch (err: any) {
+    throw formatAuthError(err);
+  }
+
+  throw new Error("Não foi possível obter o token de acesso da Microsoft. Verifique se sua conta corporativa possui acesso ao SharePoint.");
 }
 
 // Captura do token após redirect, mantendo estritamente em memória
@@ -227,8 +288,13 @@ export async function verificarResultadoRedirect() {
     const result = await getRedirectResult(auth);
     if (result) {
       const credential = OAuthProvider.credentialFromResult(result);
-      if (credential?.accessToken) {
-        setMemoryToken(credential.accessToken);
+      const token =
+        credential?.accessToken ||
+        (result as any)?._tokenResponse?.oauthAccessToken ||
+        (result as any)?._tokenResponse?.accessToken ||
+        null;
+      if (token) {
+        setMemoryToken(token);
       }
     }
     return result;

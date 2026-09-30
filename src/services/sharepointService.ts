@@ -1,5 +1,6 @@
 import { getMemoryToken, reautenticarMicrosoft } from "../auth";
 import { SHAREPOINT_HOSTNAME, SHAREPOINT_SITE_PATH, SHAREPOINT_LIBRARY } from "../config/sharepoint";
+import { apiFetch } from "./api";
 
 export interface SharePointItem {
   id: string;
@@ -99,7 +100,8 @@ async function callGraphGet<T>(
     try {
       token = await reautenticarMicrosoft();
     } catch (authErr: any) {
-      throw new GraphError(401, "Sua sessão expirou. Entre novamente.");
+      const msg = authErr?.message || "Autenticação Microsoft necessária para acessar o SharePoint.";
+      throw new GraphError(401, msg);
     }
   }
 
@@ -488,10 +490,11 @@ export async function carregarProximosItensSharePoint(
 
 /**
  * 5. Busca o conteúdo binário de um arquivo no SharePoint via Microsoft Graph,
- * mantendo o conteúdo SOMENTE em memória como Blob/File:
- * GET https://graph.microsoft.com/v1.0/drives/{drive-id}/items/{item-id}/content
- * com header Authorization: Bearer <token>
- * Lê a resposta com response.blob() e cria um objeto File em memória (new File([blob], nome, { type })).
+ * mantendo o conteúdo SOMENTE em memória como Blob/File.
+ * 
+ * Se a requisição direta pelo navegador falhar (devido ao redirecionamento 302
+ * do SharePoint que não envia cabeçalhos CORS para origens web arbitrárias em produção),
+ * faz fallback transparente para o proxy seguro do servidor (/api/sharepoint/download-content).
  */
 export async function obterArquivoSharePointEmMemoria(
   driveId: string,
@@ -499,16 +502,55 @@ export async function obterArquivoSharePointEmMemoria(
   fileName: string,
   mimeTypeHint?: string
 ): Promise<File> {
-  const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`;
-  const blob = await callGraphGet<Blob>(url, "blob");
+  const token = getMemoryToken();
+  const directUrl = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`;
+
+  // 1. Tenta download direto pelo navegador via Graph API
+  try {
+    const blob = await callGraphGet<Blob>(directUrl, "blob");
+    if (blob && blob.size > 0) {
+      const type = blob.type || mimeTypeHint || "application/octet-stream";
+      return new File([blob], fileName, { type });
+    }
+  } catch (directErr: any) {
+    console.warn(
+      `[SharePoint] Download direto via Graph falhou (${directErr.message || directErr}). Utilizando proxy seguro do backend para contornar restrições de CORS...`
+    );
+  }
+
+  // 2. Fallback via proxy seguro do servidor (Node.js segue o redirecionamento 302 sem bloqueio de CORS)
+  const proxyUrl = `/api/sharepoint/download-content?driveId=${encodeURIComponent(driveId)}&itemId=${encodeURIComponent(itemId)}&fileName=${encodeURIComponent(fileName)}`;
+  const headers: Record<string, string> = {};
+  if (token) {
+    headers["x-ms-graph-token"] = token;
+  }
+
+  const res = await apiFetch(proxyUrl, {
+    method: "GET",
+    headers,
+  });
+
+  if (!res.ok) {
+    const errJson = await res.json().catch(() => ({}));
+    throw new Error(
+      errJson.error || `Falha ao carregar o arquivo do SharePoint pelo servidor (HTTP ${res.status}).`
+    );
+  }
+
+  const blob = await res.blob();
+  if (!blob || blob.size === 0) {
+    throw new Error("O arquivo retornado do SharePoint está vazio (0 bytes).");
+  }
+
   const type = blob.type || mimeTypeHint || "application/octet-stream";
   return new File([blob], fileName, { type });
 }
 
 export async function baixarArquivoSharePoint(
   driveId: string,
-  itemId: string
+  itemId: string,
+  fileName?: string
 ): Promise<Blob> {
-  const url = `https://graph.microsoft.com/v1.0/drives/${driveId}/items/${itemId}/content`;
-  return await callGraphGet<Blob>(url, "blob");
+  const file = await obterArquivoSharePointEmMemoria(driveId, itemId, fileName || "documento");
+  return file;
 }

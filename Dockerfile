@@ -41,6 +41,7 @@ COPY --from=builder /app/dist ./dist
 
 # Copia configurações opcionais de runtime se presentes
 COPY --from=builder /app/firebase-applet-config.json* ./
+COPY --from=builder /app/.env* ./
 
 # Ajusta propriedade dos arquivos
 RUN chown -R appuser:appgroup /app

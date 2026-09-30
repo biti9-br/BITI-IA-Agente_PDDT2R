@@ -524,15 +524,29 @@ async function getUserChunks(userEmail: string, conversationId?: string): Promis
     return cached.chunks;
   }
 
-  const snap = await firestoreDb.collection(`users/${userEmailKey}/chunks`)
-    .where("conversationId", "==", targetConv)
-    .select(
-      "id", "fileId", "conversationId", "fileName", "clientId", "clientName",
-      "robotId", "robotName", "text", "secao", "embeddingModelo", "embeddingDim"
-    )
-    .get();
+  let filteredChunks: VectorChunk[] = [];
+  try {
+    const snap = await firestoreDb.collection(`users/${userEmailKey}/chunks`)
+      .where("conversationId", "==", targetConv)
+      .select(
+        "id", "fileId", "conversationId", "fileName", "clientId", "clientName",
+        "robotId", "robotName", "text", "secao", "embeddingModelo", "embeddingDim"
+      )
+      .get();
 
-  const filteredChunks = snap.docs.map(d => ({ id: d.id, ...d.data() }) as VectorChunk);
+    filteredChunks = snap.docs.map(d => ({ id: d.id, ...d.data() }) as VectorChunk);
+  } catch (err: any) {
+    if (err?.code === 7 || String(err?.message || err).includes("PERMISSION_DENIED")) {
+      const prefix = `users/${userEmailKey}/chunks/`;
+      for (const [docPath, docData] of localDocumentStore.entries()) {
+        if (docPath.startsWith(prefix) && (docData.conversationId || "default_session") === targetConv) {
+          filteredChunks.push(docData as VectorChunk);
+        }
+      }
+    } else {
+      throw err;
+    }
+  }
 
   const files = await getUserFiles(userEmail, targetConv);
   setCachedConversationData(userEmail, targetConv, filteredChunks, files);
@@ -544,7 +558,15 @@ async function getUserChunks(userEmail: string, conversationId?: string): Promis
 async function saveFileMetadata(userEmail: string, file: any): Promise<void> {
   const userEmailKey = getUserEmailKey(userEmail);
   const fileRef = doc(firestoreDb, `users/${userEmailKey}/files/${file.fileId}`);
-  await setDoc(fileRef, file, { merge: true });
+  try {
+    await setDoc(fileRef, file, { merge: true });
+  } catch (err: any) {
+    if (err?.code === 7 || String(err?.message || err).includes("PERMISSION_DENIED")) {
+      console.warn("[saveFileMetadata] Firestore PERMISSION_DENIED. Metadados salvos na memória local.");
+      return;
+    }
+    throw err;
+  }
 }
 
 // Salva chunks usando Batched Writes (máximo 450 operações por batch, gravando embedding como FieldValue.vector nativo)
@@ -586,7 +608,15 @@ async function saveChunksBatch(userEmail: string, chunks: VectorChunk[]): Promis
       }
       batch.set(chunkDocRef, dataToSave);
     }
-    await batch.commit();
+    try {
+      await batch.commit();
+    } catch (batchErr: any) {
+      if (batchErr?.code === 7 || String(batchErr?.message || batchErr).includes("PERMISSION_DENIED")) {
+        console.warn("[saveChunksBatch] Firestore PERMISSION_DENIED. Chunks mantidos na memória local.");
+      } else {
+        throw batchErr;
+      }
+    }
   }
 }
 
@@ -913,7 +943,7 @@ function chunkText(text: string, maxLength: number = 1000, overlap: number = 200
 let aiClient: GoogleGenAI | null = null;
 function getGeminiClient(): GoogleGenAI {
   if (!aiClient) {
-    const apiKey = process.env.GEMINI_API_KEY;
+    const apiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
     if (!apiKey) {
       throw new Error("GEMINI_API_KEY não configurada nas variáveis de ambiente do servidor.");
     }
@@ -1098,7 +1128,7 @@ async function getEmbeddingWithCache(
 }
 
 function getGeminiApiKey(): string {
-  const apiKey = process.env.GEMINI_API_KEY;
+  const apiKey = process.env.GEMINI_API_KEY || process.env.VITE_GEMINI_API_KEY || process.env.GOOGLE_API_KEY;
   if (!apiKey) {
     throw new Error("GEMINI_API_KEY não configurada nas variáveis de ambiente do servidor.");
   }
@@ -1225,6 +1255,20 @@ class FirestoreRetriever extends BaseRetriever {
     try {
       nearestSnap = await fetchNativeNearest(queryLimit);
     } catch (findErr: any) {
+      if (findErr?.code === 7 || String(findErr?.message || findErr).includes("PERMISSION_DENIED")) {
+        console.warn("[Vector Search] Firestore findNearest PERMISSION_DENIED. Usando chunks considerados da conversa como fallback.");
+        return this.consideredChunks.slice(0, 15).map((chunk: any) => new Document({
+          pageContent: chunk.text || "",
+          metadata: {
+            fileId: chunk.fileId,
+            fileName: chunk.fileName,
+            secao: chunk.secao,
+            clientName: chunk.clientName,
+            robotName: chunk.robotName,
+            distancia: 0
+          }
+        }));
+      }
       if (
         findErr?.code === 9 ||
         String(findErr?.message).includes("FAILED_PRECONDITION") ||
@@ -2835,124 +2879,122 @@ app.post("/api/db/add-source", async (req, res) => {
   let oldFilesToClean: string[] = [];
 
   try {
-    await firestoreDb.runTransaction(async (transaction) => {
-      const filesColRef = firestoreDb.collection(`users/${userEmailKey}/files`);
-      const filesSnap = await transaction.get(filesColRef);
+    const filesColRef = collection(firestoreDb, `users/${userEmailKey}/files`);
+    const filesSnap = await getDocs(filesColRef);
 
-      const now = Date.now();
-      const TEN_MINUTES_MS = 10 * 60 * 1000;
+    const now = Date.now();
+    const TEN_MINUTES_MS = 10 * 60 * 1000;
 
-      // Filtra arquivos da conversa e remove registros "processando" com mais de 10 minutos (expirados)
-      const existingConvFiles: any[] = [];
-      for (const d of filesSnap.docs) {
-        const fileData = { id: d.id, ...d.data() } as any;
-        const convId = fileData.conversationId || "default_session";
-        if (convId !== targetConversationId) continue;
+    // Filtra arquivos da conversa e remove registros "processando" com mais de 10 minutos (expirados)
+    const existingConvFiles: any[] = [];
+    for (const d of filesSnap.docs) {
+      const fileData = { id: d.id, ...d.data() } as any;
+      const convId = fileData.conversationId || "default_session";
+      if (convId !== targetConversationId) continue;
 
-        // Trata registros "processando" com mais de 10 minutos como expirados e remove
-        if (fileData.status === "processando") {
-          const timestamp = new Date(fileData.createdAt || fileData.indexedAt || 0).getTime();
-          if (now - timestamp > TEN_MINUTES_MS) {
-            console.log(`[Transação] Removendo registro expirado 'processando' (${d.id}) com mais de 10 minutos.`);
-            transaction.delete(d.ref);
-            oldFilesToClean.push(fileData.fileId || d.id);
-            continue; // Ignora o registro expirado para as regras de duplicidade
-          }
-        }
-
-        existingConvFiles.push(fileData);
-      }
-
-      // a) Mesmo checksum na mesma conversa
-      const existingSameChecksum = existingConvFiles.find((f: any) => f.checksum && f.checksum === checksum);
-      if (existingSameChecksum) {
-        if (existingSameChecksum.status === "processando") {
-          const err: any = new Error("Este documento já está sendo processado nesta conversa.");
-          err.statusCode = 409;
-          err.payload = {
-            code: "ALREADY_EXISTS_SAME_CONVERSATION",
-            message: "Este documento já está sendo processado nesta conversa.",
-            error: "Este documento já está sendo processado nesta conversa."
-          };
-          throw err;
-        }
-
-        // Exceção: se o formato não for markdown, substitui a versão antiga
-        if (existingSameChecksum.formatoConteudo && existingSameChecksum.formatoConteudo !== "markdown") {
-          console.log(`[Reimportação de Formato Antigo] Substituindo versão antiga (${existingSameChecksum.fileId})`);
-          if (existingSameChecksum.fileId) {
-            transaction.delete(firestoreDb.doc(`users/${userEmailKey}/files/${existingSameChecksum.fileId}`));
-            oldFilesToClean.push(existingSameChecksum.fileId);
-          }
-        } else {
-          const dateVal = existingSameChecksum.indexedAt || existingSameChecksum.createdAt || new Date().toISOString();
-          const dateObj = new Date(dateVal);
-          const dataFormatada = !isNaN(dateObj.getTime())
-            ? `${dateObj.toLocaleDateString("pt-BR")} às ${dateObj.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`
-            : "data anterior";
-          const existingDocName = existingSameChecksum.fileName || existingSameChecksum.originalName || name;
-          const msg = `Este documento já foi importado nesta conversa como '${existingDocName}' em ${dataFormatada}.`;
-          console.warn(`[Duplicidade] Documento bloqueado pela regra de checksum: ${msg}`);
-          const err: any = new Error(msg);
-          err.statusCode = 409;
-          err.payload = {
-            code: "ALREADY_EXISTS_SAME_CONVERSATION",
-            message: msg,
-            error: msg
-          };
-          throw err;
+      // Trata registros "processando" com mais de 10 minutos como expirados e remove
+      if (fileData.status === "processando") {
+        const timestamp = new Date(fileData.createdAt || fileData.indexedAt || 0).getTime();
+        if (now - timestamp > TEN_MINUTES_MS) {
+          console.log(`[Transação] Removendo registro expirado 'processando' (${d.id}) com mais de 10 minutos.`);
+          await deleteDoc(d.ref);
+          oldFilesToClean.push(fileData.fileId || d.id);
+          continue; // Ignora o registro expirado para as regras de duplicidade
         }
       }
 
-      // b) Mesmo nome de arquivo na mesma conversa
-      const cleanNameLower = name.trim().toLowerCase();
-      const sameNameFile = existingConvFiles.find((f: any) => {
-        const fname = (f.fileName || f.originalName || "").trim().toLowerCase();
-        return fname === cleanNameLower && f.checksum !== checksum;
-      });
+      existingConvFiles.push(fileData);
+    }
 
-      if (sameNameFile) {
-        if (!action) {
-          console.warn(`[Nova Versão] Arquivo com mesmo nome "${name}", mas checksum diferente. Solicitando confirmação.`);
-          const err: any = new Error(`Já existe um arquivo com o nome '${sameNameFile.fileName}' nesta conversa com conteúdo diferente.`);
-          err.statusCode = 409;
-          err.payload = {
-            code: "NEW_VERSION",
-            message: `Já existe um arquivo com o nome '${sameNameFile.fileName}' nesta conversa com conteúdo diferente.`,
-            existingFileId: sameNameFile.fileId,
-            existingFileName: sameNameFile.fileName
-          };
-          throw err;
-        }
-
-        if (action === "replace") {
-          console.log(`[Nova Versão] Substituindo versão anterior do arquivo "${sameNameFile.fileName}" (${sameNameFile.fileId})...`);
-          if (sameNameFile.fileId) {
-            transaction.delete(firestoreDb.doc(`users/${userEmailKey}/files/${sameNameFile.fileId}`));
-            oldFilesToClean.push(sameNameFile.fileId);
-          }
-        }
+    // a) Mesmo checksum na mesma conversa
+    const existingSameChecksum = existingConvFiles.find((f: any) => f.checksum && f.checksum === checksum);
+    if (existingSameChecksum) {
+      if (existingSameChecksum.status === "processando") {
+        const err: any = new Error("Este documento já está sendo processado nesta conversa.");
+        err.statusCode = 409;
+        err.payload = {
+          code: "ALREADY_EXISTS_SAME_CONVERSATION",
+          message: "Este documento já está sendo processado nesta conversa.",
+          error: "Este documento já está sendo processado nesta conversa."
+        };
+        throw err;
       }
 
-      // 2. Criação do registro do novo arquivo com status "processando" dentro da transação
-      const initialFileRecord = {
-        fileId,
-        conversationId: targetConversationId,
-        fileName: name,
-        originalName: originalName || name,
-        clientId,
-        clientName,
-        robotId,
-        robotName,
-        origin: origin || "Arquivo local",
-        folderPath: folderPath || undefined,
-        checksum,
-        status: "processando",
-        createdAt: new Date().toISOString()
-      };
+      // Exceção: se o formato não for markdown, substitui a versão antiga
+      if (existingSameChecksum.formatoConteudo && existingSameChecksum.formatoConteudo !== "markdown") {
+        console.log(`[Reimportação de Formato Antigo] Substituindo versão antiga (${existingSameChecksum.fileId})`);
+        if (existingSameChecksum.fileId) {
+          await deleteDoc(doc(firestoreDb, `users/${userEmailKey}/files/${existingSameChecksum.fileId}`));
+          oldFilesToClean.push(existingSameChecksum.fileId);
+        }
+      } else {
+        const dateVal = existingSameChecksum.indexedAt || existingSameChecksum.createdAt || new Date().toISOString();
+        const dateObj = new Date(dateVal);
+        const dataFormatada = !isNaN(dateObj.getTime())
+          ? `${dateObj.toLocaleDateString("pt-BR")} às ${dateObj.toLocaleTimeString("pt-BR", { hour: "2-digit", minute: "2-digit" })}`
+          : "data anterior";
+        const existingDocName = existingSameChecksum.fileName || existingSameChecksum.originalName || name;
+        const msg = `Este documento já foi importado nesta conversa como '${existingDocName}' em ${dataFormatada}.`;
+        console.warn(`[Duplicidade] Documento bloqueado pela regra de checksum: ${msg}`);
+        const err: any = new Error(msg);
+        err.statusCode = 409;
+        err.payload = {
+          code: "ALREADY_EXISTS_SAME_CONVERSATION",
+          message: msg,
+          error: msg
+        };
+        throw err;
+      }
+    }
 
-      transaction.set(firestoreDb.doc(`users/${userEmailKey}/files/${fileId}`), initialFileRecord);
+    // b) Mesmo nome de arquivo na mesma conversa
+    const cleanNameLower = name.trim().toLowerCase();
+    const sameNameFile = existingConvFiles.find((f: any) => {
+      const fname = (f.fileName || f.originalName || "").trim().toLowerCase();
+      return fname === cleanNameLower && f.checksum !== checksum;
     });
+
+    if (sameNameFile) {
+      if (!action) {
+        console.warn(`[Nova Versão] Arquivo com mesmo nome "${name}", mas checksum diferente. Solicitando confirmação.`);
+        const err: any = new Error(`Já existe um arquivo com o nome '${sameNameFile.fileName}' nesta conversa com conteúdo diferente.`);
+        err.statusCode = 409;
+        err.payload = {
+          code: "NEW_VERSION",
+          message: `Já existe um arquivo com o nome '${sameNameFile.fileName}' nesta conversa com conteúdo diferente.`,
+          existingFileId: sameNameFile.fileId,
+          existingFileName: sameNameFile.fileName
+        };
+        throw err;
+      }
+
+      if (action === "replace") {
+        console.log(`[Nova Versão] Substituindo versão anterior do arquivo "${sameNameFile.fileName}" (${sameNameFile.fileId})...`);
+        if (sameNameFile.fileId) {
+          await deleteDoc(doc(firestoreDb, `users/${userEmailKey}/files/${sameNameFile.fileId}`));
+          oldFilesToClean.push(sameNameFile.fileId);
+        }
+      }
+    }
+
+    // 2. Criação do registro do novo arquivo com status "processando"
+    const initialFileRecord: any = {
+      fileId,
+      conversationId: targetConversationId,
+      fileName: name,
+      originalName: originalName || name,
+      clientId,
+      clientName,
+      robotId,
+      robotName,
+      origin: origin || "Arquivo local",
+      folderPath: folderPath || "",
+      checksum,
+      status: "processando",
+      createdAt: new Date().toISOString()
+    };
+
+    await setDoc(doc(firestoreDb, `users/${userEmailKey}/files/${fileId}`), initialFileRecord);
   } catch (err: any) {
     if (err.statusCode && err.payload) {
       return res.status(err.statusCode).json(err.payload);
@@ -2986,14 +3028,19 @@ app.post("/api/db/add-source", async (req, res) => {
       
       const userEmailKey = getUserEmailKey(resolvedUserEmail);
       // Busca os chunks originais diretamente com o embedding preservado
-      const origChunksSnap = await firestoreDb.collection(`users/${userEmailKey}/chunks`)
-        .where("fileId", "==", existingOtherConv.fileId)
-        .get();
-
       let existingChunks: any[] = [];
-      if (!origChunksSnap.empty) {
-        existingChunks = origChunksSnap.docs.map(d => ({ id: d.id, ...d.data() }));
-      } else {
+      try {
+        const origChunksSnap = await firestoreDb.collection(`users/${userEmailKey}/chunks`)
+          .where("fileId", "==", existingOtherConv.fileId)
+          .get();
+        if (!origChunksSnap.empty) {
+          existingChunks = origChunksSnap.docs.map(d => ({ id: d.id, ...d.data() }));
+        }
+      } catch (origErr: any) {
+        console.warn("[add-source] Falha ao consultar chunks originais no Firestore:", origErr?.message || origErr);
+      }
+
+      if (existingChunks.length === 0) {
         const allOtherChunks = await getUserChunks(resolvedUserEmail, existingOtherConv.conversationId);
         existingChunks = allOtherChunks.filter(c => c.fileId === existingOtherConv.fileId);
       }
@@ -3167,7 +3214,7 @@ app.post("/api/db/add-source", async (req, res) => {
       chunkCount: fileChunks.length,
       indexedAt: new Date().toISOString(),
       origin: origin || "Arquivo local",
-      folderPath: folderPath || undefined,
+      folderPath: folderPath || "",
       originalName: originalName || name,
       checksum: checksum,
       tipoDocumento: validationResult.tipo,
@@ -3192,6 +3239,59 @@ app.post("/api/db/add-source", async (req, res) => {
     console.error(`[Processamento Falhou] Removendo registro 'processando' do arquivo "${name}":`, heavyErr);
     await removeProcessingRecord(resolvedUserEmail, targetConversationId, fileId, checksum, name);
     return res.status(500).json({ error: heavyErr.message || "Erro durante o processamento pesado do arquivo." });
+  }
+});
+
+// 2.1.0 Proxy seguro para download de arquivos do Microsoft SharePoint / Graph API
+// Resolve restrições de CORS e redirecionamentos 302 em navegadores
+app.get("/api/sharepoint/download-content", async (req, res) => {
+  const driveId = req.query.driveId as string;
+  const itemId = req.query.itemId as string;
+  const fileName = (req.query.fileName as string) || "documento";
+
+  if (!driveId || !itemId) {
+    return res.status(400).json({ error: "driveId e itemId são parâmetros obrigatórios." });
+  }
+
+  const msToken = (req.headers["x-ms-graph-token"] as string) || "";
+  if (!msToken) {
+    return res.status(401).json({ error: "Token de acesso do Microsoft Graph não fornecido no cabeçalho x-ms-graph-token." });
+  }
+
+  try {
+    const graphUrl = `https://graph.microsoft.com/v1.0/drives/${encodeURIComponent(driveId)}/items/${encodeURIComponent(itemId)}/content`;
+    console.log(`[SharePoint Proxy] Baixando arquivo "${fileName}" (Drive: ${driveId}, Item: ${itemId})...`);
+
+    const graphRes = await fetch(graphUrl, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${msToken}`,
+        Accept: "*/*",
+      },
+      redirect: "follow",
+    });
+
+    if (!graphRes.ok) {
+      const errText = await graphRes.text().catch(() => "");
+      console.error(`[SharePoint Proxy] Erro do Graph (${graphRes.status}):`, errText);
+      return res.status(graphRes.status).json({
+        error: `Erro ao obter arquivo do Microsoft Graph (HTTP ${graphRes.status}): ${graphRes.statusText}`
+      });
+    }
+
+    const contentType = graphRes.headers.get("content-type") || "application/octet-stream";
+    const arrayBuffer = await graphRes.arrayBuffer();
+    const buffer = Buffer.from(arrayBuffer);
+
+    console.log(`[SharePoint Proxy] Arquivo "${fileName}" obtido com sucesso: ${(buffer.length / 1024).toFixed(1)} KB`);
+
+    res.setHeader("Content-Type", contentType);
+    res.setHeader("Content-Length", buffer.length.toString());
+    res.setHeader("Content-Disposition", `attachment; filename="${encodeURIComponent(fileName)}"`);
+    return res.send(buffer);
+  } catch (err: any) {
+    console.error("[SharePoint Proxy] Erro interno ao buscar arquivo:", err);
+    return res.status(500).json({ error: err.message || "Falha na conexão do servidor com o SharePoint." });
   }
 });
 
