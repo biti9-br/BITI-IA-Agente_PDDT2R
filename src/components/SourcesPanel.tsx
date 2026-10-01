@@ -21,8 +21,7 @@ import {
   X,
   Check,
   Building2,
-  ExternalLink,
-  Eye
+  ExternalLink
 } from "lucide-react";
 import { ClientGroup, PDDDocument } from "../types";
 import SharePointBrowserModal from "./SharePointBrowserModal";
@@ -968,21 +967,8 @@ export default function SourcesPanel({
                       </div>
                     </div>
 
-                    {/* Ações Rápidas (Ver conteúdo e Excluir) */}
+                    {/* Ação Rápida (Excluir) */}
                     <div className="flex items-center gap-1 flex-shrink-0 opacity-80 group-hover:opacity-100 transition-opacity">
-                      <button
-                        type="button"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setPreviewFile(file);
-                        }}
-                        className="p-1.5 text-[var(--cor-texto-secundario)] hover:text-[var(--cor-primaria)] hover:bg-[var(--cor-superficie)] rounded-lg transition-colors cursor-pointer"
-                        title="Ver conteúdo extraído"
-                        aria-label="Ver conteúdo extraído"
-                      >
-                        <Eye className="w-3.5 h-3.5" />
-                      </button>
-
                       <button
                         type="button"
                         onClick={(e) => handleDelete(e, file.id)}
