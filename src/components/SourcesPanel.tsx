@@ -75,6 +75,7 @@ export default function SourcesPanel({
   const [searchQuery, setSearchQuery] = useState("");
   const [visibleLimit, setVisibleLimit] = useState(50);
   const [failedFiles, setFailedFiles] = useState<File[]>([]);
+  const [reprocessingFileId, setReprocessingFileId] = useState<string | null>(null);
 
   // Estados para Menu de Origem e Modal SharePoint
   const [addMenuOpen, setAddMenuOpen] = useState(false);
@@ -505,6 +506,41 @@ export default function SourcesPanel({
     } catch (err: any) {
       setLocalDeletedFileIds(prev => prev.filter(id => id !== fileId));
       setUploadStatus({ message: err.message || "Erro ao remover.", type: "error" });
+    }
+  };
+
+  const handleReprocess = async (e: React.MouseEvent, fileId: string) => {
+    e.stopPropagation();
+    const doc = files.find(f => f.id === fileId);
+    const fileName = doc ? doc.name : "Documento";
+
+    setReprocessingFileId(fileId);
+    setUploadStatus({ message: `Reprocessando "${fileName}" (apagando chunks e extraindo do zero)...`, type: null });
+
+    try {
+      const res = await apiFetch("/api/db/reprocess-source", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ fileId, conversationId: activeSessionId })
+      });
+
+      if (res.ok) {
+        setUploadStatus({ message: `Documento "${fileName}" reprocessado com sucesso.`, type: "success" });
+        onRefresh();
+      } else {
+        const data = await res.json().catch(() => ({}));
+        setUploadStatus({
+          message: data.error || `Erro ao reprocessar "${fileName}".`,
+          type: "error"
+        });
+      }
+    } catch (err: any) {
+      setUploadStatus({
+        message: err.message || `Erro de conexão ao reprocessar "${fileName}".`,
+        type: "error"
+      });
+    } finally {
+      setReprocessingFileId(null);
     }
   };
 
@@ -967,8 +1003,18 @@ export default function SourcesPanel({
                       </div>
                     </div>
 
-                    {/* Ação Rápida (Excluir) */}
+                    {/* Ações Rápidas (Reprocessar e Excluir) */}
                     <div className="flex items-center gap-1 flex-shrink-0 opacity-80 group-hover:opacity-100 transition-opacity">
+                      <button
+                        type="button"
+                        onClick={(e) => handleReprocess(e, file.id)}
+                        disabled={reprocessingFileId === file.id}
+                        className="p-1.5 text-[var(--cor-texto-secundario)] hover:text-blue-500 hover:bg-blue-500/10 rounded-lg transition-colors cursor-pointer disabled:opacity-50"
+                        title="Reprocessar documento"
+                        aria-label="Reprocessar documento"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${reprocessingFileId === file.id ? "animate-spin text-blue-500" : ""}`} />
+                      </button>
                       <button
                         type="button"
                         onClick={(e) => handleDelete(e, file.id)}

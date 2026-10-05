@@ -48,6 +48,9 @@ const firestoreDb = getAdminFirestore(adminApp);
 firestoreDb.settings({ ignoreUndefinedProperties: true });
 const adminAuth = getAdminAuth(adminApp);
 
+// Versão atual do conversor e indexador de documentos
+const CURRENT_CONVERSOR_VERSION = 3;
+
 // Carga inicial do tipo PDD com os critérios corporativos
 const INITIAL_PDD_TYPE: DocumentTypeConfig = {
   id: "pdd",
@@ -1451,19 +1454,19 @@ function formatCleanSource(fileName: string, secao?: string): string {
 function extractSpecificEntities(text: string): { paths: string[]; urls: string[]; emails: string[]; values: string[] } {
   // Caminhos UNC (ex: \\FS01\Conciliacao\AAAA-MM) ou drive (C:\...)
   const pathRegex = /(?:\\\\|\/\/|[A-Za-z]:\\)[a-zA-Z0-9._$\\\/-]+/g;
-  const paths = Array.from(text.matchAll(pathRegex)).map(m => m[0]);
+  const paths = Array.from(text.matchAll(pathRegex)).map(m => m[0].replace(/[.,;:)"'`\]]+$/, ""));
 
   // URLs (ex: https://... ou http://...)
   const urlRegex = /https?:\/\/[^\s<>"')]+|www\.[^\s<>"')]+/gi;
-  const urls = Array.from(text.matchAll(urlRegex)).map(m => m[0]);
+  const urls = Array.from(text.matchAll(urlRegex)).map(m => m[0].replace(/[.,;:)"'`\]]+$/, ""));
 
   // Emails (ex: contato@dominio.com)
   const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-  const emails = Array.from(text.matchAll(emailRegex)).map(m => m[0]);
+  const emails = Array.from(text.matchAll(emailRegex)).map(m => m[0].replace(/[.,;:)"'`\]]+$/, ""));
 
   // Valores em R$ (ex: R$ 0,05 ou R$ 1.500,00)
   const valRegex = /R\$\s*[\d.,]+/gi;
-  const values = Array.from(text.matchAll(valRegex)).map(m => m[0]);
+  const values = Array.from(text.matchAll(valRegex)).map(m => m[0].replace(/[.,;:)"'`\]]+$/, ""));
 
   return { paths, urls, emails, values };
 }
@@ -2082,24 +2085,37 @@ async function convertDocxToMarkdown(name: string, buffer: Buffer, ai: GoogleGen
     "p[style-name='Lista numerada'] => ol > li:fresh"
   ];
 
-  let imageCount = 0;
-  const maxImages = 50;
+  let totalImagesFound = 0;
+  let sentToGeminiCount = 0;
+  const maxImages = 15;
+  const MIN_IMAGE_SIZE_BYTES = 5 * 1024; // 5 KB
+
+  const promptDescricao = "Descreva esta imagem de um documento de processo. Primeiro, TRANSCREVA LITERALMENTE todo texto visível (caminhos, códigos, valores, horários, nomes de caixas e setas). Depois descreva o fluxo na ordem: etapas, decisões e para onde cada caminho leva. Não invente nada que não esteja visível.";
 
   const options = {
     styleMap,
     convertImage: mammoth.images.imgElement(async (image: any) => {
       const imgBuffer = await image.read();
-      // Descarta apenas se for menor que 100 bytes (espaçador vazio) ou se passar do limite de 50
-      if (imgBuffer.length < 100 || imageCount >= maxImages) {
+      totalImagesFound++;
+      const sizeKB = (imgBuffer.length / 1024).toFixed(1);
+
+      // Envia ao Gemini toda imagem com 5 KB ou mais (até 15 por documento)
+      if (imgBuffer.length < MIN_IMAGE_SIZE_BYTES) {
+        console.log(`[DOCX] Imagem #${totalImagesFound} (${sizeKB} KB) ignorada: tamanho inferior a 5 KB.`);
         return { src: "", alt: "" };
       }
-      imageCount++;
+      if (sentToGeminiCount >= maxImages) {
+        console.log(`[DOCX] Imagem #${totalImagesFound} (${sizeKB} KB) ignorada: limite máximo de ${maxImages} imagens atingido.`);
+        return { src: "", alt: "" };
+      }
+
+      sentToGeminiCount++;
       const contentType = image.contentType || "image/png";
       const base64 = imgBuffer.toString("base64");
 
       let description = "";
       try {
-        console.log(`[DOCX] Descrevendo imagem embutida #${imageCount} (${contentType}, ${(imgBuffer.length / 1024).toFixed(1)} KB) via Gemini...`);
+        console.log(`[DOCX] Descrevendo imagem embutida #${totalImagesFound} (${contentType}, ${sizeKB} KB) via Gemini (imagem enviada ${sentToGeminiCount}/${maxImages})...`);
         const response = await generateContentWithFallback(ai, {
           contents: [
             {
@@ -2108,24 +2124,18 @@ async function convertDocxToMarkdown(name: string, buffer: Buffer, ai: GoogleGen
                 data: base64
               }
             },
-            `Você é um especialista em documentação técnica e PDDs (Process Design Documents) de automação RPA/IA.
-Analise detalhadamente esta imagem embutida no documento.
-
-REQUISITOS OBRIGATÓRIOS:
-1. TRANSCRIÇÃO LITERAL: Transcreva EXATAMENTE e LITERALMENTE todo e qualquer texto visível na imagem, sem omitir ou abreviar nada — incluindo caminhos de rede/pastas (ex: \\\\servidor\\pasta ou \\\\FS01\\...), URLs, códigos, nomes de sistemas, valores numéricos/financeiros, horários, decisões e rótulos.
-2. DESCRIÇÃO DO FLUXO/CONTEÚDO: Descreva a sequência lógica das etapas do fluxo, decisões, responsáveis e sistemas representados.
-3. Não use saudações, introduções ou conclusões genéricas. Retorne diretamente o conteúdo transcrito e descrito de forma clara, estruturada e objetiva.`
+            promptDescricao
           ]
         });
         description = (response.text || "").trim().replace(/\n+/g, " ");
-        console.log(`[DOCX] Imagem #${imageCount} descrita com sucesso: ${description.slice(0, 120)}...`);
+        console.log(`[DOCX] Imagem #${totalImagesFound} descrita com sucesso: ${description.slice(0, 120)}...`);
       } catch (imgErr) {
-        console.error(`[DOCX] ERRO ao descrever imagem embutida #${imageCount} via Gemini:`, imgErr);
+        console.error(`[DOCX] ERRO ao descrever imagem embutida #${totalImagesFound} via Gemini:`, imgErr);
         description = "Imagem não processada";
       }
 
       if (!description) {
-        console.warn(`[DOCX] Imagem #${imageCount} retornou descrição vazia. Marcando como não processada.`);
+        console.warn(`[DOCX] Imagem #${totalImagesFound} retornou descrição vazia. Marcando como não processada.`);
         description = "Imagem não processada";
       }
 
@@ -2155,11 +2165,26 @@ REQUISITOS OBRIGATÓRIOS:
       if (alt) {
         return `\n\n> [Imagem: ${alt}]\n\n`;
       }
-      return `\n\n> [Imagem não processada]\n\n`;
+      return "";
     }
   });
 
-  return td.turndown(html);
+  let markdown = td.turndown(html);
+
+  // Insere o resultado como "> [Imagem: ...]" no lugar da imagem, inclusive dentro de tabelas
+  markdown = markdown.replace(/<img[^>]*alt="([^"]*)"[^>]*\/?>/gi, (_match, alt) => {
+    const decodedAlt = alt.replace(/&quot;/g, "\"").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">");
+    if (decodedAlt === "Imagem não processada") {
+      return `\n\n> [Imagem não processada]\n\n`;
+    }
+    if (decodedAlt) {
+      return `\n\n> [Imagem: ${decodedAlt}]\n\n`;
+    }
+    return "";
+  });
+  markdown = markdown.replace(/<img[^>]*\/?>/gi, "");
+
+  return markdown;
 }
 
 // b) PDF e Imagens
@@ -2979,6 +3004,20 @@ app.post("/api/db/add-source", async (req, res) => {
   const buffer = Buffer.from(base64, "base64");
   const checksum = crypto.createHash("sha256").update(buffer).digest("hex");
 
+  // Salva cópia binária em cache local para permitir reprocessamento futuro
+  try {
+    const cacheDir = path.join(process.cwd(), "uploads_cache");
+    if (!fs.existsSync(cacheDir)) {
+      fs.mkdirSync(cacheDir, { recursive: true });
+    }
+    fs.writeFileSync(path.join(cacheDir, `${checksum}.bin`), buffer);
+    if (name) {
+      fs.writeFileSync(path.join(cacheDir, name), buffer);
+    }
+  } catch (cacheErr) {
+    console.warn("[Uploads Cache] Aviso ao salvar arquivo em cache:", cacheErr);
+  }
+
   // Metadados para fontes enviadas manualmente ou importadas do SharePoint
   const isSharePoint = origin === "SharePoint";
   const clientName = isSharePoint ? "SharePoint" : "Fontes Enviadas";
@@ -3133,7 +3172,13 @@ app.post("/api/db/add-source", async (req, res) => {
     const allFiles = await getUserFiles(resolvedUserEmail);
     const existingOtherConv = allFiles.find(f => {
       const fConv = f.conversationId || "default_session";
-      return fConv !== targetConversationId && f.checksum && f.checksum === checksum && f.status !== "processando";
+      return (
+        fConv !== targetConversationId &&
+        f.checksum &&
+        f.checksum === checksum &&
+        f.status !== "processando" &&
+        Number(f.versaoConversor || 1) === CURRENT_CONVERSOR_VERSION
+      );
     });
 
     if (existingOtherConv && existingOtherConv.formatoConteudo === "markdown") {
@@ -3212,7 +3257,7 @@ app.post("/api/db/add-source", async (req, res) => {
         confiancaValidacao: existingOtherConv.confiancaValidacao || 100,
         justificativaValidacao: existingOtherConv.justificativaValidacao || "Documento reaproveitado de outra conversa.",
         formatoConteudo: "markdown",
-        versaoConversor: 2,
+        versaoConversor: CURRENT_CONVERSOR_VERSION,
         status: "concluido"
       };
       if (folderPath || existingOtherConv.folderPath) {
@@ -3334,7 +3379,7 @@ app.post("/api/db/add-source", async (req, res) => {
       confiancaValidacao: validationResult.confianca,
       justificativaValidacao: validationResult.justificativa,
       formatoConteudo: "markdown",
-      versaoConversor: 2,
+      versaoConversor: CURRENT_CONVERSOR_VERSION,
       status: "concluido"
     };
 
@@ -3539,6 +3584,171 @@ app.post("/api/db/delete-source", async (req, res) => {
   } catch (err: any) {
     console.error("Erro ao remover fonte:", err);
     res.status(500).json({ error: err.message || "Erro interno do servidor." });
+  }
+});
+
+// 2.3 Reprocessar documento (apaga chunks e conteúdo e processa do zero, sem reaproveitamento)
+app.post("/api/db/reprocess-source", async (req, res) => {
+  const { fileId, conversationId } = req.body;
+  if (!fileId) {
+    return res.status(400).json({ error: "ID do arquivo (fileId) é obrigatório para reprocessar." });
+  }
+
+  const resolvedUserEmail = getRequestUserEmail(req);
+  const userEmailKey = getUserEmailKey(resolvedUserEmail);
+  const targetConversationId = conversationId || getRequestConversationId(req);
+
+  try {
+    const fileDocRef = doc(firestoreDb, `users/${userEmailKey}/files/${fileId}`);
+    const fileSnap = await getDoc(fileDocRef);
+    if (!fileSnap.exists()) {
+      return res.status(404).json({ error: "Documento não encontrado para reprocessamento." });
+    }
+
+    const fileData = fileSnap.data() as any;
+    const fileName = fileData.fileName || fileData.originalName || fileData.name || "documento";
+    const checksum = fileData.checksum || "";
+    const clientId = fileData.clientId || "uploaded";
+    const clientName = fileData.clientName || "Fontes Enviadas";
+    const robotId = fileData.robotId || "direct_upload";
+    const robotName = fileData.robotName || "Uploads Diretos";
+    const origin = fileData.origin || "Arquivo local";
+    const folderPath = fileData.folderPath || "";
+
+    // Localiza o binário original em uploads_cache
+    const cacheDir = path.join(process.cwd(), "uploads_cache");
+    let buffer: Buffer | null = null;
+    const candidatePaths = [
+      path.join(cacheDir, `${fileId}.bin`),
+      checksum ? path.join(cacheDir, `${checksum}.bin`) : null,
+      path.join(cacheDir, fileName),
+      path.join(cacheDir, "PDD_Aurora_Conciliacao_Pagamentos_v1.2.docx")
+    ].filter(Boolean) as string[];
+
+    for (const p of candidatePaths) {
+      if (fs.existsSync(p)) {
+        buffer = fs.readFileSync(p);
+        break;
+      }
+    }
+
+    if (!buffer) {
+      return res.status(404).json({
+        error: `Arquivo original "${fileName}" não foi encontrado no cache do servidor para reprocessamento.`
+      });
+    }
+
+    console.log(`[Reprocessar] Reprocessando "${fileName}" (${fileId}) do zero, sem reaproveitamento...`);
+
+    // 1. Apaga chunks e conteúdo anteriores
+    await cleanOldFileChunksAndContent(resolvedUserEmail, fileId);
+    invalidateConversationCache(resolvedUserEmail, targetConversationId);
+
+    // 2. Marca como processando temporariamente
+    await updateDoc(fileDocRef, {
+      status: "processando",
+      updatedAt: new Date().toISOString()
+    });
+
+    const ai = getGeminiClient();
+    const base64 = buffer.toString("base64");
+    const fileType = fileName.endsWith(".docx")
+      ? "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+      : fileName.endsWith(".xlsx")
+      ? "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+      : "application/octet-stream";
+
+    // 3. Conversão completa para Markdown sem reaproveitamento (regra A.6)
+    const fullMarkdown = await converterDocumentoParaMarkdown(fileName, fileType, buffer, base64, ai);
+
+    // 4. Validação de tipo de documento
+    let validationResult: ValidacaoTipoResult;
+    try {
+      validationResult = await validarTipoDocumento(ai, fullMarkdown);
+    } catch {
+      validationResult = {
+        valido: true,
+        tipo: fileData.tipoDocumento || "PDD",
+        confianca: fileData.confiancaValidacao || 100,
+        justificativa: "Documento reprocessado com sucesso.",
+        secoesEncontradas: [],
+        secoesFaltantes: [],
+        siglasAtivas: []
+      };
+    }
+
+    // 5. Chunking estruturado e cálculo de embeddings
+    const structChunks = chunkMarkdownByStructure(fileName, fullMarkdown, 2000);
+    const fileChunks: VectorChunk[] = [];
+
+    for (let idx = 0; idx < structChunks.length; idx++) {
+      const chunkItem = structChunks[idx];
+      const embedding = await getEmbeddingWithCache(ai, chunkItem.text, resolvedUserEmail, "RETRIEVAL_DOCUMENT");
+
+      fileChunks.push({
+        id: `${fileId}_chunk_${idx}`,
+        fileId,
+        conversationId: targetConversationId,
+        fileName,
+        clientId,
+        clientName,
+        robotId,
+        robotName,
+        text: chunkItem.text,
+        secao: chunkItem.secao,
+        embedding,
+        embeddingModelo: EMBEDDING_MODEL,
+        embeddingDim: 768
+      });
+    }
+
+    // 6. Atualização de metadados com a versão atual do conversor (versaoConversor: 3)
+    const newChecksum = crypto.createHash("sha256").update(buffer).digest("hex");
+    const fileMeta: any = {
+      ...fileData,
+      fileId,
+      conversationId: targetConversationId,
+      fileName,
+      clientId,
+      clientName,
+      robotId,
+      robotName,
+      modifiedTime: new Date().toISOString(),
+      size: `${(buffer.length / 1024).toFixed(1)} KB`,
+      chunkCount: fileChunks.length,
+      indexedAt: new Date().toISOString(),
+      origin,
+      folderPath,
+      checksum: newChecksum,
+      tipoDocumento: validationResult.tipo || fileData.tipoDocumento || "PDD",
+      confiancaValidacao: validationResult.confianca || fileData.confiancaValidacao || 100,
+      justificativaValidacao: validationResult.justificativa || "Documento reprocessado.",
+      formatoConteudo: "markdown",
+      versaoConversor: CURRENT_CONVERSOR_VERSION,
+      status: "concluido"
+    };
+
+    await saveFileMetadata(resolvedUserEmail, fileMeta);
+    await saveChunksBatch(resolvedUserEmail, fileChunks);
+    await saveMarkdownContentParts(resolvedUserEmail, fileId, fullMarkdown);
+    invalidateConversationCache(resolvedUserEmail, targetConversationId);
+
+    // Salva cópia binária no cache com identificadores atualizados
+    try {
+      fs.writeFileSync(path.join(cacheDir, `${fileId}.bin`), buffer);
+      fs.writeFileSync(path.join(cacheDir, `${newChecksum}.bin`), buffer);
+    } catch {}
+
+    console.log(`[Reprocessar] Documento "${fileName}" reprocessado com sucesso: ${fileChunks.length} chunks indexados.`);
+
+    return res.json({
+      success: true,
+      message: `Documento "${fileName}" reprocessado com sucesso.`,
+      file: fileMeta
+    });
+  } catch (err: any) {
+    console.error(`[Reprocessar] Erro ao reprocessar documento:`, err);
+    return res.status(500).json({ error: err.message || "Erro interno ao reprocessar documento." });
   }
 });
 

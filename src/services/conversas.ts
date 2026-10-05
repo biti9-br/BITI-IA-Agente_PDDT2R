@@ -20,13 +20,17 @@ export interface ConversaDoc {
 export async function salvarSessaoFirestore(uid: string, sessao: ChatSession): Promise<void> {
   if (!sessao?.id) return;
   try {
-    await apiFetch("/api/conversations", {
+    const res = await apiFetch("/api/conversations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(sessao)
     });
-  } catch (err) {
-    console.error(`Erro ao salvar sessão ${sessao.id} via API:`, err);
+    if (!res.ok) {
+      const errText = await res.text().catch(() => "");
+      console.warn(`[salvarSessaoFirestore] Servidor respondeu status ${res.status}:`, errText);
+    }
+  } catch (err: any) {
+    console.warn(`[salvarSessaoFirestore] Falha ao sincronizar sessão ${sessao.id} via API:`, err?.message || err);
   }
 }
 
@@ -54,8 +58,8 @@ export async function excluirSessaoFirestore(uid: string, sessaoId: string): Pro
     await apiFetch(`/api/conversations/${sessaoId}`, {
       method: "DELETE"
     });
-  } catch (err) {
-    console.error(`Erro ao excluir sessão ${sessaoId} via API:`, err);
+  } catch (err: any) {
+    console.warn(`[excluirSessaoFirestore] Falha ao excluir sessão ${sessaoId} via API:`, err?.message || err);
   }
 }
 
@@ -70,8 +74,8 @@ export async function renomearSessaoFirestore(uid: string, sessaoId: string, nov
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title: novoTitulo })
     });
-  } catch (err) {
-    console.error(`Erro ao renomear sessão ${sessaoId} via API:`, err);
+  } catch (err: any) {
+    console.warn(`[renomearSessaoFirestore] Falha ao renomear sessão ${sessaoId} via API:`, err?.message || err);
   }
 }
 

@@ -42,10 +42,24 @@ export async function apiFetch(url: RequestInfo | URL, options?: RequestInit): P
     return headers;
   };
 
-  let response = await fetch(url, {
-    ...options,
-    headers: prepareHeaders(token),
-  });
+  let response: Response;
+  try {
+    response = await fetch(url, {
+      ...options,
+      headers: prepareHeaders(token),
+    });
+  } catch (fetchErr: any) {
+    // Se for erro transitório de rede ou reinício momentâneo do servidor ("Failed to fetch"), tenta novamente
+    if (fetchErr?.name === "TypeError" || fetchErr?.message?.includes("Failed to fetch")) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      response = await fetch(url, {
+        ...options,
+        headers: prepareHeaders(token),
+      });
+    } else {
+      throw fetchErr;
+    }
+  }
 
   // se a resposta for 401, obtém um token novo com getIdToken(true) e repete a chamada UMA vez
   if (response.status === 401) {
