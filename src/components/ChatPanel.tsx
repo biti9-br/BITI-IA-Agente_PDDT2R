@@ -31,13 +31,6 @@ interface ChatPanelProps {
   userId?: string;
 }
 
-const QUICK_PROMPTS = [
-  "Quais são todos os robôs do Cliente A?",
-  "Como funciona o fluxo do Robô de Abertura de Contas?",
-  "O que o robô faz em caso de divergência de conciliação bancária?",
-  "Quais sites ou sistemas o emissor de notas fiscais acessa?"
-];
-
 const WELCOME_FULL_TEXT = "Olá,! sou o **Robbi9**, assistente de consultas da **Biti9**\n\nFui treinado para analisar os seus **Process Design Documents (PDDs)** e planilhas/documentos **T2R**.\n\nComo posso ajudar você hoje?";
 
 function normalizeWelcomeInSessions(sessList: ChatSession[]): ChatSession[] {
@@ -223,11 +216,12 @@ export default function ChatPanel({
     try {
       setBaixandoPdfMsgId(msg.id);
       const titulo = activeSession.title || "Consulta de Automação biti9";
-      const blob = gerarBlobPDF(titulo, "Consulta", msg.text);
+      const cleanText = (msg.text || "").replace(/\[\[SEM_INFORMACAO\]\]/g, "Não encontrei essa informação nos documentos selecionados.");
+      const blob = gerarBlobPDF(titulo, "Consulta", cleanText);
       const url = URL.createObjectURL(blob);
       const a = document.createElement("a");
       a.href = url;
-      const safeTitle = titulo.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 30);
+      const safeTitle = titulo.replace(/[^a-zA-Z0-9_\-]/g, "_").slice(0, 30);
       a.download = `Consulta_${safeTitle}_${Date.now()}.pdf`;
       document.body.appendChild(a);
       a.click();
@@ -311,6 +305,64 @@ export default function ChatPanel({
   const [attachedFiles, setAttachedFiles] = useState<Array<{ name: string; type: string; base64: string }>>([]);
   const [attachmentError, setAttachmentError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
+
+  // Perguntas sugeridas dinâmicas geradas a partir dos documentos selecionados
+  const [suggestedPrompts, setSuggestedPrompts] = useState<string[]>([]);
+  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
+
+  // Cache de perguntas sugeridas por combinação de documentos selecionados
+  const suggestionsCacheRef = useRef<Record<string, string[]>>({});
+
+  // Busca 4 perguntas sugeridas dinâmicas sempre que as fontes selecionadas mudarem
+  const selectedIdsSerialized = JSON.stringify([...selectedFileIds].sort());
+  useEffect(() => {
+    if (!selectedFileIds || selectedFileIds.length === 0) {
+      setSuggestedPrompts([]);
+      setLoadingSuggestions(false);
+      return;
+    }
+
+    const cacheKey = [...selectedFileIds].sort().join(",");
+    if (suggestionsCacheRef.current[cacheKey] && suggestionsCacheRef.current[cacheKey].length > 0) {
+      setSuggestedPrompts(suggestionsCacheRef.current[cacheKey]);
+      setLoadingSuggestions(false);
+      return;
+    }
+
+    let isMounted = true;
+    setLoadingSuggestions(true);
+
+    apiFetch("/api/suggested-prompts", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        selectedFileIds,
+        sessionId: activeSession.id
+      })
+    })
+      .then(res => res.json())
+      .then(data => {
+        if (isMounted) {
+          if (data && Array.isArray(data.suggestions) && data.suggestions.length > 0) {
+            suggestionsCacheRef.current[cacheKey] = data.suggestions;
+            setSuggestedPrompts(data.suggestions);
+          } else {
+            setSuggestedPrompts([]);
+          }
+        }
+      })
+      .catch(err => {
+        console.warn("[Suggested Prompts] Erro ao carregar perguntas sugeridas:", err);
+        if (isMounted) setSuggestedPrompts([]);
+      })
+      .finally(() => {
+        if (isMounted) setLoadingSuggestions(false);
+      });
+
+    return () => {
+      isMounted = false;
+    };
+  }, [selectedIdsSerialized, activeSession.id]);
 
   const chatEndRef = useRef<HTMLDivElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -538,6 +590,7 @@ export default function ChatPanel({
   };
 
   const handleSendMessage = async (textToSend: string) => {
+    if (!selectedFileIds || selectedFileIds.length === 0) return;
     if ((!textToSend.trim() && attachedFiles.length === 0) || loading) return;
 
     const filesToUpload = [...attachedFiles];
@@ -662,7 +715,22 @@ export default function ChatPanel({
             if (parsed.error) {
               throw new Error(parsed.error);
             }
-            if (parsed.text) {
+            if (parsed.replaceText !== undefined) {
+              accumulatedText = parsed.replaceText;
+              setSessions(prevSessions =>
+                prevSessions.map(sess => {
+                  if (sess.id === activeSession.id) {
+                    return {
+                      ...sess,
+                      messages: sess.messages.map(m =>
+                        m.id === assistantMessageId ? { ...m, text: accumulatedText } : m
+                      )
+                    };
+                  }
+                  return sess;
+                })
+              );
+            } else if (parsed.text) {
               accumulatedText += parsed.text;
               setSessions(prevSessions =>
                 prevSessions.map(sess => {
@@ -694,7 +762,9 @@ export default function ChatPanel({
         const dataStr = buffer.trim().replace(/^data:\s*/, "");
         try {
           const parsed = JSON.parse(dataStr);
-          if (parsed.text) {
+          if (parsed.replaceText !== undefined) {
+            accumulatedText = parsed.replaceText;
+          } else if (parsed.text) {
             accumulatedText += parsed.text;
           }
           if (parsed.sources) {
@@ -797,6 +867,19 @@ export default function ChatPanel({
       ""
     );
 
+    // Se a mensagem for [[SEM_INFORMACAO]] (resposta inteira)
+    if (normalizedText.trim() === "[[SEM_INFORMACAO]]") {
+      return (
+        <div className="inline-flex items-center gap-2 px-3 py-2 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800/60 rounded-xl text-xs text-amber-800 dark:text-amber-200 font-medium">
+          <AlertCircle className="w-4 h-4 text-amber-600 dark:text-amber-400 flex-shrink-0" />
+          <span>Não encontrei essa informação nos documentos selecionados.</span>
+        </div>
+      );
+    }
+
+    // A interface nunca exibe o texto cru [[SEM_INFORMACAO]]
+    normalizedText = normalizedText.replace(/\[\[SEM_INFORMACAO\]\]/g, "Não encontrei essa informação nos documentos selecionados.");
+
     const lines = normalizedText.split("\n");
     const elements: React.ReactNode[] = [];
     let i = 0;
@@ -821,7 +904,7 @@ export default function ChatPanel({
 
           let startIndex = 1;
           // Pula a linha divisória (|---|---|) se ela contiver apenas hífens, dois-pontos e pipes
-          if (tableLines[1].replace(/[\s|:-]/g, "").length === 0) {
+          if (tableLines[1].replace(/[\s|:\-]/g, "").length === 0) {
             startIndex = 2;
           }
 
@@ -915,26 +998,31 @@ export default function ChatPanel({
 
       // Tópicos com marcadores (*, -, •)
       if (trimmed.startsWith("* ") || trimmed.startsWith("- ") || trimmed.startsWith("• ")) {
-        const cleaned = trimmed.replace(/^[\s*-•]+/, "");
-        elements.push(
-          <div key={`bullet_${i}`} className="flex items-start gap-2 pl-2 my-1">
-            <span className="text-[var(--cor-primaria)] select-none mt-1.5 text-[6px]">●</span>
-            <span className="text-xs leading-relaxed">{renderInlineStyles(cleaned)}</span>
-          </div>
-        );
+        const cleaned = trimmed.replace(/^[*\-•]\s+/, "");
+        if (cleaned.trim().length > 0) {
+          elements.push(
+            <div key={`bullet_${i}`} className="flex items-start gap-2 pl-2 my-1">
+              <span className="text-[var(--cor-primaria)] select-none mt-1.5 text-[6px]">●</span>
+              <span className="text-xs leading-relaxed">{renderInlineStyles(cleaned)}</span>
+            </div>
+          );
+        }
         i++;
         continue;
       }
 
       // Tópicos numerados (1. , 2. )
-      const numMatch = trimmed.match(/^(\d+)\.\s(.*)/);
+      const numMatch = trimmed.match(/^(\d+)\.\s+(.*)/);
       if (numMatch) {
-        elements.push(
-          <div key={`num_${i}`} className="flex items-start gap-2 pl-2 my-1">
-            <span className="text-[var(--cor-primaria)] text-xs font-semibold shrink-0">{numMatch[1]}.</span>
-            <span className="text-xs leading-relaxed">{renderInlineStyles(numMatch[2])}</span>
-          </div>
-        );
+        const numText = numMatch[2].trim();
+        if (numText.length > 0) {
+          elements.push(
+            <div key={`num_${i}`} className="flex items-start gap-2 pl-2 my-1">
+              <span className="text-[var(--cor-primaria)] text-xs font-semibold shrink-0">{numMatch[1]}.</span>
+              <span className="text-xs leading-relaxed">{renderInlineStyles(numMatch[2])}</span>
+            </div>
+          );
+        }
         i++;
         continue;
       }
@@ -956,7 +1044,7 @@ export default function ChatPanel({
   };
 
   const renderInlineStyles = (txt: string) => {
-    const parts = txt.split(/(\*\*.*?\*\*|\*[^*\n]+?\*|`.*?`|\(Fonte:[^)]+\)|\[\[SEM_INFORMACAO\]\])/g);
+    const parts = txt.split(/(\*\*.*?\*\*|\*[^*\n]+?\*|`.*?`|\(Fonte:[^)]+\)|\[\[SEM_INFORMACAO\]\]|Não encontrei essa informação nos documentos selecionados\.)/g);
     return parts.map((part, idx) => {
       if (part.startsWith("**") && part.endsWith("**")) {
         return <strong key={idx} className="font-semibold text-inherit">{part.slice(2, -2)}</strong>;
@@ -975,7 +1063,11 @@ export default function ChatPanel({
           </span>
         );
       }
-      if (part === "[[SEM_INFORMACAO]]" || part.trim() === "[[SEM_INFORMACAO]]") {
+      if (
+        part === "[[SEM_INFORMACAO]]" ||
+        part.trim() === "[[SEM_INFORMACAO]]" ||
+        part === "Não encontrei essa informação nos documentos selecionados."
+      ) {
         return (
           <span key={idx} className="inline-flex items-center gap-1.5 px-2.5 py-1 bg-[var(--cor-aviso-fundo)] border border-[#FFE0A3] rounded text-xs text-[var(--cor-aviso-texto)] font-medium">
             <AlertCircle className="w-3.5 h-3.5 text-[var(--cor-aviso-texto)] inline flex-shrink-0" />
@@ -1226,15 +1318,16 @@ export default function ChatPanel({
               <span>Nenhuma fonte ativa no painel lateral. Marque os arquivos que deseja consultar ou adicione novos no botão <strong>"+ Adicionar fontes"</strong>.</span>
             </div>
           )}
-          {/* Chips de Perguntas Rápidas */}
-          {messages.length <= 2 && !loading && !isTyping && (
-            <div className="space-y-1.5">
+
+          {/* Chips de Perguntas Sugeridas Geradas a Partir dos Documentos Selecionados */}
+          {selectedFileIds && selectedFileIds.length > 0 && suggestedPrompts.length > 0 && messages.length <= 2 && !loading && !isTyping && (
+            <div className="space-y-1.5 animate-fade-in">
               <p className="text-xs font-semibold text-[var(--cor-texto-secundario)] flex items-center gap-1.5">
                 <HelpCircle className="w-3.5 h-3.5 text-[var(--cor-primaria)]" />
                 Perguntas sugeridas (Clique para consultar)
               </p>
               <div className="flex flex-wrap gap-1.5">
-                {QUICK_PROMPTS.map((prompt, i) => (
+                {suggestedPrompts.map((prompt, i) => (
                   <button
                     key={i}
                     onClick={() => handleSendMessage(prompt)}
@@ -1315,15 +1408,16 @@ export default function ChatPanel({
               type="text"
               value={inputText}
               onChange={(e) => setInputText(e.target.value)}
-              placeholder="Pergunte algo sobre os robôs..."
-              disabled={loading || isTyping}
-              className="w-full bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-full py-2.5 pl-4 pr-12 text-xs text-[var(--cor-texto)] placeholder-[var(--cor-texto-secundario)] focus:outline-none focus:border-[var(--cor-primaria)] focus:bg-[var(--cor-card-fundo)] focus:ring-1 focus:ring-[var(--cor-primaria)]/20 transition-all disabled:opacity-50 font-sans"
+              placeholder={(!selectedFileIds || selectedFileIds.length === 0) ? "Selecione ao menos uma fonte para perguntar" : "Pergunte algo sobre os robôs..."}
+              disabled={loading || isTyping || !selectedFileIds || selectedFileIds.length === 0}
+              title={(!selectedFileIds || selectedFileIds.length === 0) ? "Selecione ao menos uma fonte para perguntar" : undefined}
+              className="w-full bg-[var(--cor-superficie)] border border-[var(--cor-borda)] rounded-full py-2.5 pl-4 pr-12 text-xs text-[var(--cor-texto)] placeholder-[var(--cor-texto-secundario)] focus:outline-none focus:border-[var(--cor-primaria)] focus:bg-[var(--cor-card-fundo)] focus:ring-1 focus:ring-[var(--cor-primaria)]/20 transition-all disabled:opacity-50 disabled:cursor-not-allowed font-sans"
             />
             <button
               type="submit"
-              disabled={loading || isTyping || (!inputText.trim() && attachedFiles.length === 0)}
-              className="absolute right-1.5 p-2 bg-[var(--cor-primaria)] hover:bg-[var(--cor-primaria-hover)] disabled:bg-[var(--cor-superficie)] disabled:text-[var(--cor-texto-secundario)] text-white rounded-full transition-all flex items-center justify-center flex-shrink-0 cursor-pointer shadow-xs"
-              title="Enviar"
+              disabled={loading || isTyping || !selectedFileIds || selectedFileIds.length === 0 || (!inputText.trim() && attachedFiles.length === 0)}
+              className="absolute right-1.5 p-2 bg-[var(--cor-primaria)] hover:bg-[var(--cor-primaria-hover)] disabled:bg-[var(--cor-superficie)] disabled:text-[var(--cor-texto-secundario)] disabled:cursor-not-allowed text-white rounded-full transition-all flex items-center justify-center flex-shrink-0 cursor-pointer shadow-xs"
+              title={(!selectedFileIds || selectedFileIds.length === 0) ? "Selecione ao menos uma fonte para perguntar" : "Enviar"}
             >
               <Send className="w-3.5 h-3.5" />
             </button>

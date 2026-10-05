@@ -465,6 +465,9 @@ interface ConversationCache {
 const conversationChunksCache = new Map<string, ConversationCache>();
 const CONVERSATION_CACHE_TTL_MS = 5 * 60 * 1000; // 5 minutos
 
+// Cache em memória de perguntas sugeridas por combinação de documentos selecionados
+const suggestedPromptsCache = new Map<string, string[]>();
+
 function getCachedConversationData(userEmail: string, conversationId: string): ConversationCache | null {
   const key = `${getUserEmailKey(userEmail)}:${conversationId}`;
   const cached = conversationChunksCache.get(key);
@@ -718,6 +721,20 @@ async function deleteFileAndAssociations(userEmail: string, fileId: string): Pro
 
   // 4. Invalida cache da conversa
   invalidateConversationCache(userEmail, conversationId);
+
+  // Limpa também localDocumentStore caso haja registros locais
+  for (const key of Array.from(localDocumentStore.keys())) {
+    if (key.includes(fileId)) {
+      localDocumentStore.delete(key);
+    }
+  }
+
+  // Invalida cache de perguntas sugeridas que envolvam este arquivo
+  for (const key of Array.from(suggestedPromptsCache.keys())) {
+    if (key.includes(fileId)) {
+      suggestedPromptsCache.delete(key);
+    }
+  }
 
   return true;
 }
@@ -1285,21 +1302,20 @@ class FirestoreRetriever extends BaseRetriever {
 
     let matchedDocs = nearestSnap.docs || [];
 
-    // Se houver selectedFileIds, filtre os resultados por fileId; se sobrarem menos de 12, repita com limit maior (até 50).
-    if (this.selectedFileIds && Array.isArray(this.selectedFileIds) && this.selectedFileIds.length > 0) {
-      let filtered = matchedDocs.filter((d: any) => this.selectedFileIds!.includes(d.get("fileId")));
-      if (filtered.length < 12 && queryLimit < 50) {
-        try {
-          queryLimit = 50;
-          const snap50 = await fetchNativeNearest(queryLimit);
-          filtered = (snap50.docs || []).filter((d: any) => this.selectedFileIds!.includes(d.get("fileId")));
-          matchedDocs = filtered;
-        } catch (e: any) {
-          console.warn("[Vector Search] Aviso ao tentar busca expandida com limit 50:", e);
-        }
-      } else {
+    // Filtra estritamente pelos fileIds permitidos (presentes em consideredChunks)
+    const allowedFileIds = new Set(this.consideredChunks.map((c: any) => c.fileId));
+    let filtered = matchedDocs.filter((d: any) => allowedFileIds.has(d.get("fileId")));
+    if (filtered.length < 12 && queryLimit < 50) {
+      try {
+        queryLimit = 50;
+        const snap50 = await fetchNativeNearest(queryLimit);
+        filtered = (snap50.docs || []).filter((d: any) => allowedFileIds.has(d.get("fileId")));
         matchedDocs = filtered;
+      } catch (e: any) {
+        console.warn("[Vector Search] Aviso ao tentar busca expandida com limit 50:", e);
       }
+    } else {
+      matchedDocs = filtered;
     }
 
     // 5. LOG: Em cada pergunta pela busca vetorial, registre: quantidade de chunks retornados e as distâncias.
@@ -3894,30 +3910,78 @@ async function obterUidPorEmail(email: string): Promise<string | null> {
   return null;
 }
 
-// Helper para recuperar histórico contextual recente da conversa
-async function buscarHistoricoRelevante(ai: GoogleGenAI, uidOrEmail: string, question: string, maxResults: number = 3): Promise<string[]> {
-  try {
-    const emailKey = getUserEmailKey(uidOrEmail);
-    const sessionsSnap = await getDocs(collection(firestoreDb, `users/${emailKey}/sessions`));
-    if (sessionsSnap.empty) return [];
-    
-    const results: string[] = [];
-    for (const sDoc of sessionsSnap.docs.slice(0, 5)) {
-      const msgs = await getSessionMessages(emailKey, sDoc.id);
-      if (msgs.length > 0) {
-        const textBlock = msgs.slice(-4).map(m => `${m.sender === 'user' ? 'Usuário' : 'Assistente'}: ${m.text}`).join("\n");
-        if (textBlock) {
-          results.push(textBlock);
-        }
-      }
-      if (results.length >= maxResults) break;
-    }
-    return results;
-  } catch (err) {
-    console.warn("Aviso ao buscar histórico relevante:", err);
-    return [];
+// Endpoint para sugerir 4 perguntas dinâmicas baseadas nos documentos selecionados
+app.post("/api/suggested-prompts", async (req, res) => {
+  const { selectedFileIds, sessionId } = req.body;
+  if (!selectedFileIds || !Array.isArray(selectedFileIds) || selectedFileIds.length === 0) {
+    return res.json({ suggestions: [] });
   }
-}
+
+  try {
+    const resolvedUserEmail = getRequestUserEmail(req);
+    const cacheKey = `${resolvedUserEmail}:${[...selectedFileIds].sort().join(",")}`;
+    if (suggestedPromptsCache.has(cacheKey)) {
+      const cached = suggestedPromptsCache.get(cacheKey)!;
+      if (cached && cached.length > 0) {
+        return res.json({ suggestions: cached, cached: true });
+      }
+    }
+
+    const activeSessionId = sessionId || "default_session";
+    const conversationFiles = await getUserFiles(resolvedUserEmail, activeSessionId);
+    const conversationChunks = await getUserChunks(resolvedUserEmail, activeSessionId);
+
+    const validFiles = conversationFiles.filter((f: any) => selectedFileIds.includes(f.fileId));
+    if (validFiles.length === 0) {
+      return res.json({ suggestions: [] });
+    }
+
+    let docContext = "";
+    for (const f of validFiles.slice(0, 5)) {
+      const fChunks = conversationChunks.filter((c: any) => c.fileId === f.fileId);
+      const initialSnippet = fChunks.slice(0, 2).map((c: any) => c.text || "").join("\n").slice(0, 1500);
+      docContext += `\n[DOCUMENTO: ${f.fileName}]\nCliente: ${f.clientName}\nRobô: ${f.robotName}\nTipo: ${f.tipoDocumento || "PDD"}\nTrecho / Resumo inicial:\n"""\n${initialSnippet}\n"""\n`;
+    }
+
+    const ai = getGeminiClient();
+    const prompt = `Você é um especialista em RPA e análise de PDDs (Process Design Documents) corporativos.
+Com base nas seguintes fontes técnicas selecionadas:
+${docContext}
+
+Gere exatamente 4 perguntas curtas, objetivas e relevantes (máximo 12 palavras por pergunta) que um gestor ou desenvolvedor faria sobre esse processo e que possam ser respondidas diretamente com base nesse conteúdo (ex: objetivo do robô, regras de negócio, exceções, sistemas envolvidos).
+Retorne ESTRITAMENTE um JSON com array de strings, sem formatação markdown ou explicações:
+["Pergunta 1", "Pergunta 2", "Pergunta 3", "Pergunta 4"]`;
+
+    const response = await ai.models.generateContent({
+      model: "gemini-2.5-flash",
+      contents: prompt
+    });
+
+    const rawText = response.text || "";
+    const cleanJson = rawText.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
+    let suggestions: string[] = [];
+    try {
+      const parsed = JSON.parse(cleanJson);
+      if (Array.isArray(parsed)) {
+        suggestions = parsed.map((p: any) => String(p).trim()).filter(p => p.length > 0).slice(0, 4);
+      }
+    } catch {
+      suggestions = cleanJson.split("\n")
+        .map(l => l.replace(/^[-*•\d. "]+\s*/, "").replace(/["',]+$/, "").trim())
+        .filter(l => l.length > 5)
+        .slice(0, 4);
+    }
+
+    if (suggestions.length > 0) {
+      suggestedPromptsCache.set(cacheKey, suggestions);
+    }
+
+    return res.json({ suggestions });
+  } catch (err: any) {
+    console.warn("[/api/suggested-prompts] Erro ao gerar sugestões:", err);
+    return res.json({ suggestions: [] });
+  }
+});
 
 app.post("/api/chat", async (req, res) => {
   const { question, clientId, robotId, history, sessionId, attachment, attachments, selectedFileIds } = req.body;
@@ -3928,27 +3992,8 @@ app.post("/api/chat", async (req, res) => {
 
   try {
     const resolvedUserEmail = getRequestUserEmail(req);
-    const authenticatedUid = req.userUid || null;
-
-    const ai = getGeminiClient();
-
-    // RAG: Buscar histórico de conversas anteriores relevantes do usuário no Firestore (coleção chunks)
-    let historicoContextoText = "";
-    if (authenticatedUid) {
-      try {
-        const trechosHistorico = await buscarHistoricoRelevante(ai, authenticatedUid, question, 5);
-        if (trechosHistorico && trechosHistorico.length > 0) {
-          historicoContextoText = trechosHistorico.map((trecho, idx) => {
-            return `[TRECHO DE CONVERSA ANTERIOR #${idx + 1}]\n"""\n${trecho}\n"""`;
-          }).join("\n\n");
-        }
-      } catch (ragErr) {
-        console.warn("[RAG Histórico] Aviso ao recuperar histórico de conversas:", ragErr);
-      }
-    }
-
-    // Carregar ou inicializar a memória contínua da sessão no Firestore
     const activeSessionId = sessionId || "default_session";
+    const ai = getGeminiClient();
     const sessionMemory = await getSessionMemory(resolvedUserEmail, activeSessionId);
 
     // Salvar mensagem do usuário como documento individual no Firestore
@@ -3984,15 +4029,53 @@ Responda de forma curta e direta em português. Se não houver nada para gravar,
       console.error("Falha ao extrair aprendizados para a memória contínua:", e);
     }
 
+    // Configura resposta como streaming Server-Sent Events (SSE)
+    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    if (typeof (res as any).flushHeaders === "function") {
+      (res as any).flushHeaders();
+    }
+
+    // 1. Se selectedFileIds vier vazio, NÃO chama a LLM e avisa o usuário
+    if (!selectedFileIds || !Array.isArray(selectedFileIds) || selectedFileIds.length === 0) {
+      console.log("[/api/chat] Nenhuma fonte selecionada no painel lateral. Retornando aviso sem chamar a LLM.");
+      const answerText = "Selecione ao menos uma fonte no painel lateral.";
+      await saveChatMessage(resolvedUserEmail, activeSessionId, {
+        sender: "assistant",
+        text: answerText
+      });
+
+      res.write(`data: ${JSON.stringify({ text: answerText })}\n\n`);
+      res.write(`data: ${JSON.stringify({ done: true, sources: [] })}\n\n`);
+      return res.end();
+    }
+
     // Filtrar arquivos e chunks estritamente pela conversa ativa (conversationId) com cache em memória
     const conversationFiles = await getUserFiles(resolvedUserEmail, activeSessionId);
     const conversationChunks = await getUserChunks(resolvedUserEmail, activeSessionId);
 
-    // Chunks considerados: conversa ativa + filtro de selectedFileIds (se fornecido)
-    let consideredChunks = conversationChunks;
-    if (selectedFileIds && Array.isArray(selectedFileIds) && selectedFileIds.length > 0) {
-      consideredChunks = consideredChunks.filter((c: any) => selectedFileIds.includes(c.fileId));
+    // 2. Filtra arquivos válidos que ainda existem e estão selecionados
+    const validFileMap = new Map(conversationFiles.map((f: any) => [f.fileId, f]));
+    const effectiveSelectedIds = selectedFileIds.filter((id: string) => validFileMap.has(id));
+
+    if (effectiveSelectedIds.length === 0) {
+      console.log("[/api/chat] Documentos selecionados foram removidos ou não existem mais. Retornando [[SEM_INFORMACAO]].");
+      const answerText = "[[SEM_INFORMACAO]]";
+      await saveChatMessage(resolvedUserEmail, activeSessionId, {
+        sender: "assistant",
+        text: answerText
+      });
+
+      res.write(`data: ${JSON.stringify({ text: answerText })}\n\n`);
+      res.write(`data: ${JSON.stringify({ done: true, sources: [] })}\n\n`);
+      return res.end();
     }
+
+    // Chunks considerados: SOMENTE os chunks dos arquivos marcados que ainda existem em conversationFiles (descarta chunks órfãos)
+    let consideredChunks = conversationChunks.filter((c: any) => 
+      validFileMap.has(c.fileId) && effectiveSelectedIds.includes(c.fileId)
+    );
     if (clientId) {
       consideredChunks = consideredChunks.filter((c: any) => c.clientId === clientId);
     }
@@ -4012,17 +4095,8 @@ Responda de forma curta e direta em português. Se não houver nada para gravar,
       }
     }
 
-    // Configura resposta como streaming Server-Sent Events (SSE)
-    res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
-    res.setHeader("Cache-Control", "no-cache, no-transform");
-    res.setHeader("Connection", "keep-alive");
-    if (typeof (res as any).flushHeaders === "function") {
-      (res as any).flushHeaders();
-    }
-
-    // Curto-circuito antes de chamar o modelo: só pode ocorrer se nenhum documento selecionado tiver chunks
-    const hasSelectedFiles = selectedFileIds && Array.isArray(selectedFileIds) && selectedFileIds.length > 0;
-    if (hasSelectedFiles && consideredChunks.length === 0 && attachmentTexts.length === 0) {
+    // Curto-circuito antes de chamar o modelo: se nenhum documento selecionado tiver chunks
+    if (consideredChunks.length === 0 && attachmentTexts.length === 0) {
       console.log("[Curto-Circuito /api/chat] Documentos selecionados não possuem nenhum chunk indexado. Retornando [[SEM_INFORMACAO]] sem chamar a LLM.");
       const answerText = "[[SEM_INFORMACAO]]";
       await saveChatMessage(resolvedUserEmail, activeSessionId, {
@@ -4051,19 +4125,18 @@ DIRETRIZES DE RESPOSTA RÁPIDA E DIRETA:
 1. Responda primeiro à pergunta do usuário de forma direta e objetiva em poucas frases.
 2. Seja conciso e vá direto ao ponto. Use listas com marcadores ou tabelas Markdown apenas quando ajudarem a organizar e esclarecer os dados. Aprofunde explicações apenas se o usuário pedir explicitamente.
 3. NÃO gere relatório, documento formal, estrutura de slides nem mencione geração de PDF ou arquivos. Toda resposta deve ser exibida como texto direto dentro do próprio chat.
-4. Ao final da resposta, inclua obrigatoriamente uma linha final discreta indicando as fontes utilizadas no formato exato:
-Fontes: <arquivo> › <seção>
-(Se houver mais de uma fonte, separe-as por ponto e vírgula, por exemplo: Fontes: PDD_Faturamento.pdf › 3. Emissão de NF; Regras_ERP.xlsx › Geral)
 
 REGRAS OBRIGATÓRIAS DE CONTEÚDO E FIDELIDADE:
 1. Toda afirmação factual deve vir estritamente dos trechos fornecidos — nunca do seu conhecimento geral prévio.
-2. Fidelidade Literal a Siglas e Nomes: NUNCA tente adivinhar, supor ou expandir siglas ou nomes abreviados (como BMA, IGM, Vivest, etc.), a menos que o próprio texto do documento forneça expressamente a definição. Mantenha os nomes e termos técnicos exatamente como constam nos documentos.
-3. Se a pergunta não puder ser respondida com o conteúdo dos documentos fornecidos, responda SOMENTE com o texto exato: [[SEM_INFORMACAO]]
-   Não escreva mais nada além disso nesse caso — nem explicações, nem desculpas, nem saudações.
-4. Nunca misture informação real dos documentos com suposições. Se a informação for parcial, declare apenas o que está documentado.
-5. Bloqueio Estrito de Imagens: NÃO gere tags de imagens ou links de imagem (![alt](url)), responda somente em texto e tabelas Markdown.
+2. Responda SOMENTE com base nos documentos do CONTEXTO ATUAL. Mensagens anteriores desta conversa podem citar documentos que foram removidos ou desmarcados: nunca use informações delas que não estejam nos documentos atuais.
+3. Fidelidade Literal a Siglas e Nomes: NUNCA tente adivinhar, supor ou expandir siglas ou nomes abreviados (como BMA, IGM, Vivest, etc.), a menos que o próprio texto do documento forneça expressamente a definição. Mantenha os nomes e termos técnicos exatamente como constam nos documentos.
+4. Quando a pergunta pedir comparação ou citar documentos e houver apenas parte deles no contexto atual, responda com o que está disponível e declare claramente: "Apenas o documento <nome> está selecionado; não há outro documento para comparar." (substitua <nome> pelo nome do documento selecionado).
+5. O código [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem). Se a pergunta não puder ser respondida com o conteúdo dos documentos fornecidos, responda SOMENTE com o texto exato: [[SEM_INFORMACAO]]
+   Não escreva mais nada além disso nesse caso — nem explicações, nem desculpas, nem saudações. NUNCA misture [[SEM_INFORMACAO]] com outro texto.
+6. Nunca misture informação real dos documentos com suposições. Se a informação for parcial, declare apenas o que está documentado.
+7. Bloqueio Estrito de Imagens: NÃO gere tags de imagens ou links de imagem (![alt](url)), responda somente em texto e tabelas Markdown.
 ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${memoryInstructionBlock}` : ""}
-6. Responda sempre em Português Brasileiro de forma profissional e direta.`;
+8. Responda sempre em Português Brasileiro de forma profissional e direta.`;
 
     const historyMessages: (HumanMessage | AIMessage)[] = [];
     if (history && Array.isArray(history)) {
@@ -4083,14 +4156,11 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
     let retrieverRunnable: any;
 
     if (isOverview) {
-      let files = conversationFiles;
-      if (selectedFileIds && Array.isArray(selectedFileIds) && selectedFileIds.length > 0) {
-        files = files.filter((f: any) => selectedFileIds.includes(f.fileId));
-      }
+      let files = conversationFiles.filter((f: any) => effectiveSelectedIds.includes(f.fileId));
 
-      let filesListText = "LISTA COMPLETA DE ARQUIVOS, CLIENTES E PROCESSOS DA CONVERSA ATUAL:\n";
+      let filesListText = "LISTA COMPLETA DE ARQUIVOS, CLIENTES E PROCESSOS SELECIONADOS NA CONVERSA ATUAL:\n";
       if (files.length === 0) {
-        filesListText += "(Nenhum arquivo ou cliente cadastrado nesta conversa. O painel de fontes desta conversa está vazio ou ainda não foi sincronizado.)\n";
+        filesListText += "(Nenhum arquivo ou cliente selecionado nesta conversa.)\n";
       } else {
         files.forEach((file: any, idx: number) => {
           filesListText += `- Arquivo #${idx + 1}: "${file.fileName}"\n`;
@@ -4130,7 +4200,7 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
         activeSessionId,
         consideredChunks,
         conversationChunks,
-        selectedFileIds,
+        selectedFileIds: effectiveSelectedIds,
         embeddings
       });
       formatContextFn = (docs: Document[]) => {
@@ -4164,11 +4234,16 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
           if (attachmentTexts.length > 0) {
             merged += `Você recebeu arquivos anexados diretamente no chat pelo usuário para análise em tempo real.\n\n${attachmentTexts.join("\n\n")}\n\n`;
           }
+          const selectedDocsList = conversationFiles
+            .filter((f: any) => effectiveSelectedIds.includes(f.fileId))
+            .map((f: any) => f.fileName);
+          const docsLabel = selectedDocsList.length === 1
+            ? `DOCUMENTO ATUALMENTE SELECIONADO: "${selectedDocsList[0]}" (apenas 1 documento selecionado)`
+            : `DOCUMENTOS ATUALMENTE SELECIONADOS (${selectedDocsList.length}): ${selectedDocsList.map(n => `"${n}"`).join(", ")}`;
+          merged += `${docsLabel}\n\n`;
+
           if (prev.context) {
             merged += `CONTEXTO ADICIONAL DO BANCO DE DADOS:\n============================================================\n${prev.context}\n============================================================\n\n`;
-          }
-          if (historicoContextoText) {
-            merged += `CONTEXTO DE HISTÓRICO DE CONVERSAS ANTERIORES DO USUÁRIO (RAG):\n============================================================\n${historicoContextoText}\n============================================================\n\n`;
           }
           if (memoryInstructionBlock) {
             merged += `\n⚠️ LEMBRETE DE REGRAS PERSONALIZADAS/INSTRUÇÕES DA SESSÃO:\n${memoryInstructionBlock}\n`;
@@ -4177,8 +4252,9 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
 1. Responda primeiro à pergunta em poucas frases diretas. Use listas ou tabelas Markdown apenas quando ajudarem a organizar os dados.
 2. Aprofunde apenas se o usuário tiver pedido.
 3. Não crie relatórios nem mencione PDF ou documentos de download.
-4. Ao final da resposta, inclua a linha discreta de fontes: "Fontes: <arquivo> › <seção>".
-5. Se a informação não constar nos trechos fornecidos, responda estritamente: [[SEM_INFORMACAO]].`;
+4. Responda SOMENTE com base nos documentos do CONTEXTO ATUAL. Mensagens anteriores desta conversa podem citar documentos que foram removidos ou desmarcados: nunca use informações delas que não estejam nos documentos atuais.
+5. Quando a pergunta pedir comparação ou citar documentos e houver apenas parte deles no contexto atual, responda com o que está disponível e declare claramente: "Apenas o documento <nome> está selecionado; não há outro documento para comparar."
+6. [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem). Se não houver informação nos documentos para responder à pergunta, responda estritamente: [[SEM_INFORMACAO]]. Nunca misture esse código com outro texto.`;
           return merged;
         }
       },
@@ -4205,6 +4281,15 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
     const chainDuration = Date.now() - chainStartTime;
     console.log(`[LangChain] cadeia executada em ${chainDuration} ms`);
 
+    // 2. [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem).
+    // Se a LLM devolver esse código misturado com outro texto, o servidor deve removê-lo.
+    if (fullAnswerText.trim() === "[[SEM_INFORMACAO]]") {
+      fullAnswerText = "[[SEM_INFORMACAO]]";
+    } else if (fullAnswerText.includes("[[SEM_INFORMACAO]]")) {
+      fullAnswerText = fullAnswerText.replace(/\[\[SEM_INFORMACAO\]\]/g, "").replace(/\s{2,}/g, " ").trim();
+      res.write(`data: ${JSON.stringify({ replaceText: fullAnswerText })}\n\n`);
+    }
+
     const sources = retrievedDocs.map(doc => ({
       fileName: doc.metadata.fileName,
       clientName: doc.metadata.clientName,
@@ -4214,13 +4299,14 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
       score: typeof doc.metadata.distancia === "number" ? Math.max(0, 1 - doc.metadata.distancia) : 1.0
     }));
 
-    // Se o modelo não incluiu a linha de fontes e temos fontes relevantes, anexa a linha discreta de fontes
-    if (sources.length > 0 && !fullAnswerText.includes("Fontes:") && !fullAnswerText.includes("[[SEM_INFORMACAO]]")) {
+    // O SERVIDOR monta essa linha a partir dos chunks realmente enviados no contexto (arquivo › seção, sem repetir) e a anexa ao final da resposta
+    if (sources.length > 0 && !fullAnswerText.includes("[[SEM_INFORMACAO]]")) {
       const uniqueSources = Array.from(new Set(sources.map(s => {
         const sec = s.secao ? ` › ${s.secao}` : "";
         return `${s.fileName}${sec}`;
       })));
       if (uniqueSources.length > 0) {
+        fullAnswerText = fullAnswerText.replace(/\n*Fontes:.*$/is, "").trim();
         const sourcesLine = `\n\nFontes: ${uniqueSources.join("; ")}`;
         fullAnswerText += sourcesLine;
         res.write(`data: ${JSON.stringify({ text: sourcesLine })}\n\n`);
