@@ -1428,13 +1428,93 @@ class FirestoreRetriever extends BaseRetriever {
   }
 }
 
+// Formata nome de fonte limpo: <arquivo> › <seção> usando apenas o último nível da seção, sem [Documento: ...] ou níveis vazios (> > >)
+function formatCleanSource(fileName: string, secao?: string): string {
+  if (!secao) return fileName;
+  // Remove prefixos como [Documento: ...] ou colchetes externos
+  let raw = secao.replace(/^\[Documento:\s*/i, "").replace(/\]\s*$/, "").trim();
+  // Divide por '>' e limpa
+  const parts = raw
+    .split(">")
+    .map(p => p.trim())
+    .filter(p => p.length > 0 && p !== fileName && !p.toLowerCase().startsWith("documento:"));
+  
+  if (parts.length === 0) {
+    return fileName;
+  }
+  // Pega apenas o último nível da seção (ex: "2.7 - Regras de alçada" ou "1.3 Mapa de Fluxo")
+  const lastLevel = parts[parts.length - 1];
+  return `${fileName} › ${lastLevel}`;
+}
+
+// Extrai entidades específicas para anti-invenção (caminhos, URLs, e-mails, valores em R$)
+function extractSpecificEntities(text: string): { paths: string[]; urls: string[]; emails: string[]; values: string[] } {
+  // Caminhos UNC (ex: \\FS01\Conciliacao\AAAA-MM) ou drive (C:\...)
+  const pathRegex = /(?:\\\\|\/\/|[A-Za-z]:\\)[a-zA-Z0-9._$\\\/-]+/g;
+  const paths = Array.from(text.matchAll(pathRegex)).map(m => m[0]);
+
+  // URLs (ex: https://... ou http://...)
+  const urlRegex = /https?:\/\/[^\s<>"')]+|www\.[^\s<>"')]+/gi;
+  const urls = Array.from(text.matchAll(urlRegex)).map(m => m[0]);
+
+  // Emails (ex: contato@dominio.com)
+  const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
+  const emails = Array.from(text.matchAll(emailRegex)).map(m => m[0]);
+
+  // Valores em R$ (ex: R$ 0,05 ou R$ 1.500,00)
+  const valRegex = /R\$\s*[\d.,]+/gi;
+  const values = Array.from(text.matchAll(valRegex)).map(m => m[0]);
+
+  return { paths, urls, emails, values };
+}
+
+// Verifica se há dados inventados que não existem no contexto enviado
+function findMissingEntities(answer: string, context: string): string[] {
+  const normContext = context.toLowerCase().replace(/\\\\+/g, "\\");
+  const entities = extractSpecificEntities(answer);
+  const missing: string[] = [];
+
+  for (const p of entities.paths) {
+    const normP = p.toLowerCase().replace(/\\\\+/g, "\\").trim();
+    if (normP.length > 3 && !normContext.includes(normP)) {
+      missing.push(p);
+    }
+  }
+
+  for (const u of entities.urls) {
+    const normU = u.toLowerCase().replace(/^https?:\/\//, "").trim();
+    if (normU.length > 5 && !normContext.includes(normU)) {
+      missing.push(u);
+    }
+  }
+
+  for (const e of entities.emails) {
+    const normE = e.toLowerCase().trim();
+    if (!normContext.includes(normE)) {
+      missing.push(e);
+    }
+  }
+
+  for (const v of entities.values) {
+    const numPart = v.replace(/^R\$\s*/i, "").trim();
+    const normV = v.toLowerCase().replace(/\s+/, " ").trim();
+    if (!normContext.includes(normV) && !normContext.includes(numPart)) {
+      missing.push(v);
+    }
+  }
+
+  return Array.from(new Set(missing));
+}
+
 function formatDocumentsContext(docs: Document[]): string {
   if (!docs || docs.length === 0) return "";
   return docs.map((doc, idx) => {
-    const secaoInfo = doc.metadata.secao ? `Seção / Caminho: ${doc.metadata.secao}\n` : "";
-    return `[RECURSO #${idx + 1}]
+    const refTag = `[R${idx + 1}]`;
+    const cleanSecao = formatCleanSource(doc.metadata.fileName, doc.metadata.secao);
+    return `${refTag} (Fonte: ${cleanSecao})
 Arquivo: ${doc.metadata.fileName || "Documento"}
-${secaoInfo}Cliente: ${doc.metadata.clientName || ""}
+Seção: ${cleanSecao}
+Cliente: ${doc.metadata.clientName || ""}
 Robô: ${doc.metadata.robotName || ""}
 Trecho do Documento:
 """
@@ -2003,23 +2083,23 @@ async function convertDocxToMarkdown(name: string, buffer: Buffer, ai: GoogleGen
   ];
 
   let imageCount = 0;
-  const maxImages = 15;
+  const maxImages = 50;
 
   const options = {
     styleMap,
     convertImage: mammoth.images.imgElement(async (image: any) => {
       const imgBuffer = await image.read();
-      // Ignora imagens menores que 10 KB (logos, ícones) e limita a 15 imagens
-      if (imgBuffer.length < 10 * 1024 || imageCount >= maxImages) {
-        return { src: "" };
+      // Descarta apenas se for menor que 100 bytes (espaçador vazio) ou se passar do limite de 50
+      if (imgBuffer.length < 100 || imageCount >= maxImages) {
+        return { src: "", alt: "" };
       }
       imageCount++;
       const contentType = image.contentType || "image/png";
       const base64 = imgBuffer.toString("base64");
 
-      let description = "Diagrama ou fluxo do processo";
+      let description = "";
       try {
-        console.log(`[DOCX] Descrevendo imagem embutida #${imageCount} via Gemini (${(imgBuffer.length / 1024).toFixed(1)} KB)...`);
+        console.log(`[DOCX] Descrevendo imagem embutida #${imageCount} (${contentType}, ${(imgBuffer.length / 1024).toFixed(1)} KB) via Gemini...`);
         const response = await generateContentWithFallback(ai, {
           contents: [
             {
@@ -2028,12 +2108,25 @@ async function convertDocxToMarkdown(name: string, buffer: Buffer, ai: GoogleGen
                 data: base64
               }
             },
-            "Analise esta imagem embutida de uma documentação técnica/PDD corporativa. Forneça uma descrição objetiva, clara e detalhada do fluxo, diagrama, tela ou conteúdo representado, destacando etapas, responsáveis, sistemas e decisões se houver. Não use saudações, retorne apenas a descrição objetiva do conteúdo."
+            `Você é um especialista em documentação técnica e PDDs (Process Design Documents) de automação RPA/IA.
+Analise detalhadamente esta imagem embutida no documento.
+
+REQUISITOS OBRIGATÓRIOS:
+1. TRANSCRIÇÃO LITERAL: Transcreva EXATAMENTE e LITERALMENTE todo e qualquer texto visível na imagem, sem omitir ou abreviar nada — incluindo caminhos de rede/pastas (ex: \\\\servidor\\pasta ou \\\\FS01\\...), URLs, códigos, nomes de sistemas, valores numéricos/financeiros, horários, decisões e rótulos.
+2. DESCRIÇÃO DO FLUXO/CONTEÚDO: Descreva a sequência lógica das etapas do fluxo, decisões, responsáveis e sistemas representados.
+3. Não use saudações, introduções ou conclusões genéricas. Retorne diretamente o conteúdo transcrito e descrito de forma clara, estruturada e objetiva.`
           ]
         });
-        description = (response.text || "").trim().replace(/\n+/g, " ") || description;
+        description = (response.text || "").trim().replace(/\n+/g, " ");
+        console.log(`[DOCX] Imagem #${imageCount} descrita com sucesso: ${description.slice(0, 120)}...`);
       } catch (imgErr) {
-        console.warn("Erro ao descrever imagem embutida via Gemini:", imgErr);
+        console.error(`[DOCX] ERRO ao descrever imagem embutida #${imageCount} via Gemini:`, imgErr);
+        description = "Imagem não processada";
+      }
+
+      if (!description) {
+        console.warn(`[DOCX] Imagem #${imageCount} retornou descrição vazia. Marcando como não processada.`);
+        description = "Imagem não processada";
       }
 
       return {
@@ -2056,10 +2149,13 @@ async function convertDocxToMarkdown(name: string, buffer: Buffer, ai: GoogleGen
     filter: "img",
     replacement: (_content, node) => {
       const alt = (node as HTMLElement).getAttribute("alt") || "";
+      if (alt === "Imagem não processada") {
+        return `\n\n> [Imagem não processada]\n\n`;
+      }
       if (alt) {
         return `\n\n> [Imagem: ${alt}]\n\n`;
       }
-      return "";
+      return `\n\n> [Imagem não processada]\n\n`;
     }
   });
 
@@ -2194,8 +2290,9 @@ function chunkMarkdownByStructure(fileName: string, markdown: string, maxChunkSi
   let currentSectionLines: string[] = [];
 
   function buildPath(headings: string[]) {
-    if (headings.length === 0) return `[Documento: ${fileName}]`;
-    return `[Documento: ${fileName} > ${headings.join(" > ")}]`;
+    const valid = headings.filter(h => h && h.trim().length > 0);
+    if (valid.length === 0) return `[Documento: ${fileName}]`;
+    return `[Documento: ${fileName} > ${valid.join(" > ")}]`;
   }
 
   function flushSection() {
@@ -4130,13 +4227,16 @@ REGRAS OBRIGATÓRIAS DE CONTEÚDO E FIDELIDADE:
 1. Toda afirmação factual deve vir estritamente dos trechos fornecidos — nunca do seu conhecimento geral prévio.
 2. Responda SOMENTE com base nos documentos do CONTEXTO ATUAL. Mensagens anteriores desta conversa podem citar documentos que foram removidos ou desmarcados: nunca use informações delas que não estejam nos documentos atuais.
 3. Fidelidade Literal a Siglas e Nomes: NUNCA tente adivinhar, supor ou expandir siglas ou nomes abreviados (como BMA, IGM, Vivest, etc.), a menos que o próprio texto do documento forneça expressamente a definição. Mantenha os nomes e termos técnicos exatamente como constam nos documentos.
-4. Quando a pergunta pedir comparação ou citar documentos e houver apenas parte deles no contexto atual, responda com o que está disponível e declare claramente: "Apenas o documento <nome> está selecionado; não há outro documento para comparar." (substitua <nome> pelo nome do documento selecionado).
-5. O código [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem). Se a pergunta não puder ser respondida com o conteúdo dos documentos fornecidos, responda SOMENTE com o texto exato: [[SEM_INFORMACAO]]
+4. ANTI-INVENÇÃO DE DADOS ESPECÍFICOS: Caminhos de pasta, URLs, e-mails, códigos, nomes de pessoas, valores e datas só podem aparecer na resposta se estiverem LITERALMENTE no contexto. Se não estiverem, diga que o documento não informa. Nunca crie exemplos ou valores plausíveis.
+5. MARCAÇÕES DE TEMPO DE REUNIÃO: Nos PDDs da BITi9, marcações no formato [mm:ss] indicam o minuto da reunião de mapeamento em que a etapa foi discutida.
+6. COMPARAÇÕES: A frase "Apenas o documento <nome> está selecionado; não há outro documento para comparar" só deve aparecer quando a pergunta pedir expressamente comparação entre fontes/documentos ou mencionar outros documentos. Nunca a use em respostas comuns ou factuais.
+7. O código [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem). Se a pergunta não puder ser respondida com o conteúdo dos documentos fornecidos, responda SOMENTE com o texto exato: [[SEM_INFORMACAO]]
    Não escreva mais nada além disso nesse caso — nem explicações, nem desculpas, nem saudações. NUNCA misture [[SEM_INFORMACAO]] com outro texto.
-6. Nunca misture informação real dos documentos com suposições. Se a informação for parcial, declare apenas o que está documentado.
-7. Bloqueio Estrito de Imagens: NÃO gere tags de imagens ou links de imagem (![alt](url)), responda somente em texto e tabelas Markdown.
+8. Nunca misture informação real dos documentos com suposições. Se a informação for parcial, declare apenas o que está documentado.
+9. Bloqueio Estrito de Imagens: NÃO gere tags de imagens ou links de imagem (![alt](url)), responda somente em texto e tabelas Markdown.
+10. INDICAÇÃO DE FONTES UTILIZADAS: Ao final da resposta (exceto se for [[SEM_INFORMACAO]]), indique os trechos numerados [R1], [R2]... que você realmente utilizou na formulação da resposta, terminando com: <<FONTES: R1, R2>> (máximo 3 trechos).
 ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${memoryInstructionBlock}` : ""}
-8. Responda sempre em Português Brasileiro de forma profissional e direta.`;
+11. Responda sempre em Português Brasileiro de forma profissional e direta.`;
 
     const historyMessages: (HumanMessage | AIMessage)[] = [];
     if (history && Array.isArray(history)) {
@@ -4238,12 +4338,12 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
             .filter((f: any) => effectiveSelectedIds.includes(f.fileId))
             .map((f: any) => f.fileName);
           const docsLabel = selectedDocsList.length === 1
-            ? `DOCUMENTO ATUALMENTE SELECIONADO: "${selectedDocsList[0]}" (apenas 1 documento selecionado)`
-            : `DOCUMENTOS ATUALMENTE SELECIONADOS (${selectedDocsList.length}): ${selectedDocsList.map(n => `"${n}"`).join(", ")}`;
+            ? `DOCUMENTO SELECIONADO: "${selectedDocsList[0]}"`
+            : `DOCUMENTOS SELECIONADOS (${selectedDocsList.length}): ${selectedDocsList.map(n => `"${n}"`).join(", ")}`;
           merged += `${docsLabel}\n\n`;
 
           if (prev.context) {
-            merged += `CONTEXTO ADICIONAL DO BANCO DE DADOS:\n============================================================\n${prev.context}\n============================================================\n\n`;
+            merged += `CONTEXTO DOS DOCUMENTOS (TRECHOS DISPONÍVEIS):\n============================================================\n${prev.context}\n============================================================\n\n`;
           }
           if (memoryInstructionBlock) {
             merged += `\n⚠️ LEMBRETE DE REGRAS PERSONALIZADAS/INSTRUÇÕES DA SESSÃO:\n${memoryInstructionBlock}\n`;
@@ -4253,8 +4353,11 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
 2. Aprofunde apenas se o usuário tiver pedido.
 3. Não crie relatórios nem mencione PDF ou documentos de download.
 4. Responda SOMENTE com base nos documentos do CONTEXTO ATUAL. Mensagens anteriores desta conversa podem citar documentos que foram removidos ou desmarcados: nunca use informações delas que não estejam nos documentos atuais.
-5. Quando a pergunta pedir comparação ou citar documentos e houver apenas parte deles no contexto atual, responda com o que está disponível e declare claramente: "Apenas o documento <nome> está selecionado; não há outro documento para comparar."
-6. [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem). Se não houver informação nos documentos para responder à pergunta, responda estritamente: [[SEM_INFORMACAO]]. Nunca misture esse código com outro texto.`;
+5. Caminhos de pasta, URLs, e-mails, códigos, nomes de pessoas, valores e datas só podem aparecer na resposta se estiverem LITERALMENTE no contexto. Se não estiverem, diga que o documento não informa. Nunca crie exemplos ou valores plausíveis.
+6. Nos PDDs da BITi9, marcações no formato [mm:ss] indicam o minuto da reunião de mapeamento em que a etapa foi discutida.
+7. A frase "Apenas o documento <nome> está selecionado; não há outro documento para comparar" só deve aparecer quando a pergunta pedir expressamente comparação entre documentos ou citar outros documentos. NUNCA a use em respostas comuns.
+8. [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem). Se não houver informação nos documentos para responder à pergunta, responda estritamente: [[SEM_INFORMACAO]]. Nunca misture esse código com outro texto.
+9. Se respondeu com base no contexto, finalize com <<FONTES: RX, RY>> indicando os trechos [R1], [R2] efetivamente usados (máximo 3). Se não encontrou a informação, não inclua essa marcação.`;
           return merged;
         }
       },
@@ -4264,31 +4367,116 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
     ]);
 
     const chainStartTime = Date.now();
-    let fullAnswerText = "";
-
-    const stream = await ragChain.stream({ question });
-
-    for await (const chunk of stream) {
-      if (chunk) {
-        fullAnswerText += chunk;
-        res.write(`data: ${JSON.stringify({ text: chunk })}\n\n`);
-        if (typeof (res as any).flush === "function") {
-          (res as any).flush();
-        }
-      }
-    }
-
+    let fullAnswerText = await ragChain.invoke({ question });
     const chainDuration = Date.now() - chainStartTime;
     console.log(`[LangChain] cadeia executada em ${chainDuration} ms`);
 
-    // 2. [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA (nada mais na mensagem).
-    // Se a LLM devolver esse código misturado com outro texto, o servidor deve removê-lo.
+    // 1. Extrai marcação <<FONTES: ...>>
+    let fontesTag = "";
+    const fontesMatch = fullAnswerText.match(/<<FONTES:\s*([^>]+)>>/i);
+    if (fontesMatch) {
+      fontesTag = fontesMatch[1];
+      fullAnswerText = fullAnswerText.replace(/<<FONTES:\s*([^>]+)>>/gi, "").trim();
+    }
+
+    // 2. Anti-invenção de dados específicos (caminhos, URLs, e-mails, valores em R$)
+    const sentContext = (retrievedDocs.map(d => `${d.metadata.fileName || ""} ${d.metadata.secao || ""} ${d.pageContent || ""}`).join("\n") + "\n" + (attachmentTexts || []).join("\n"));
+    const missingEntities = findMissingEntities(fullAnswerText, sentContext);
+
+    if (missingEntities.length > 0) {
+      console.warn(`[ANTI-INVENÇÃO] Dados específicos não encontrados no contexto detectados na resposta: ${missingEntities.join(", ")}. Refazendo resposta uma vez...`);
+      try {
+        const retryCorrection = `ATENÇÃO: O(s) dado(s) ${missingEntities.map(m => `"${m}"`).join(", ")} NÃO existe(m) nos documentos fornecidos; NÃO o(s) cite de forma alguma. Se a informação não constar nos documentos, declare claramente que o documento não informa essa informação.`;
+        
+        const retryResult = await chatModel.invoke([
+          ["system", systemInstruction],
+          ...historyMessages,
+          ["human", `${formatDocumentsContext(retrievedDocs)}\n\nPERGUNTA: ${question}\n\n${retryCorrection}`]
+        ]);
+        
+        const retryText = typeof retryResult.content === "string" ? retryResult.content : String(retryResult.content || "");
+        if (retryText.trim()) {
+          console.log("[ANTI-INVENÇÃO] Resposta refeita com sucesso sem os dados inventados.");
+          fullAnswerText = retryText;
+          const retryFontesMatch = fullAnswerText.match(/<<FONTES:\s*([^>]+)>>/i);
+          if (retryFontesMatch) {
+            fontesTag = retryFontesMatch[1];
+            fullAnswerText = fullAnswerText.replace(/<<FONTES:\s*([^>]+)>>/gi, "").trim();
+          }
+        }
+      } catch (retryErr) {
+        console.error("[ANTI-INVENÇÃO] Erro ao refazer resposta:", retryErr);
+      }
+    }
+
+    // 3. [[SEM_INFORMACAO]] só pode ser usado como resposta INTEIRA
     if (fullAnswerText.trim() === "[[SEM_INFORMACAO]]") {
       fullAnswerText = "[[SEM_INFORMACAO]]";
     } else if (fullAnswerText.includes("[[SEM_INFORMACAO]]")) {
       fullAnswerText = fullAnswerText.replace(/\[\[SEM_INFORMACAO\]\]/g, "").replace(/\s{2,}/g, " ").trim();
-      res.write(`data: ${JSON.stringify({ replaceText: fullAnswerText })}\n\n`);
     }
+
+    // 4. Frase de "apenas um documento" só quando pedir comparação ou citar outros documentos
+    const isDocComparisonQuery = /compare\s+(?:as|os|as\s+duas|os\s+dois|as\s+fontes|os\s+documentos)|comparativo\s+entre|comparar\s+(?:as|os|documentos|fontes|robôs)|diferença\s+entre\s+(?:os\s+documentos|as\s+fontes|os\s+robôs|as\s+duas|os\s+dois)/i.test(question);
+    if (!isDocComparisonQuery) {
+      fullAnswerText = fullAnswerText
+        .replace(/Apenas o documento [^.;\n]+ est[áa] selecionado;?\s*(?:n[ãa]o h[áa] outro documento para comparar\.?)?/gi, "")
+        .replace(/N[ãa]o h[áa] outro documento para comparar\.?/gi, "")
+        .replace(/^[\s,;.-]+/, "")
+        .trim();
+    }
+
+    // 5. Linha de fontes limpa (máximo 3, sem repetir)
+    const isSemInformacao = fullAnswerText === "[[SEM_INFORMACAO]]" || 
+      /não\s+(?:encontrei|consta|há\s+informações|foi\s+possível\s+encontrar)/i.test(fullAnswerText.slice(0, 100));
+
+    if (!isSemInformacao && retrievedDocs.length > 0) {
+      let usedDocs: Document[] = [];
+      if (fontesTag) {
+        const matches = Array.from(fontesTag.matchAll(/R(\d+)/gi));
+        const indices = matches.map(m => parseInt(m[1], 10) - 1).filter(idx => idx >= 0 && idx < retrievedDocs.length);
+        usedDocs = indices.map(idx => retrievedDocs[idx]);
+      }
+      if (usedDocs.length === 0) {
+        // Fallback: usa no máximo 2 fontes mais relevantes do retriever
+        usedDocs = retrievedDocs.slice(0, 2);
+      }
+
+      const cleanSourcesList = Array.from(new Set(
+        usedDocs.map(d => formatCleanSource(d.metadata.fileName, d.metadata.secao))
+      )).slice(0, 3);
+
+      if (cleanSourcesList.length > 0) {
+        fullAnswerText = fullAnswerText.replace(/\n*Fontes:.*$/is, "").trim();
+        fullAnswerText += `\n\nFontes: ${cleanSourcesList.join("; ")}`;
+      }
+    }
+
+    // Envia a resposta final formatada ao cliente via SSE
+    const words = fullAnswerText.split(/(\s+)/);
+    let bufferChunk = "";
+    for (const w of words) {
+      bufferChunk += w;
+      if (bufferChunk.length >= 15 || w.includes("\n")) {
+        res.write(`data: ${JSON.stringify({ text: bufferChunk })}\n\n`);
+        if (typeof (res as any).flush === "function") {
+          (res as any).flush();
+        }
+        bufferChunk = "";
+      }
+    }
+    if (bufferChunk) {
+      res.write(`data: ${JSON.stringify({ text: bufferChunk })}\n\n`);
+      if (typeof (res as any).flush === "function") {
+        (res as any).flush();
+      }
+    }
+
+    // Salva a resposta completa final no Firestore
+    await saveChatMessage(resolvedUserEmail, activeSessionId, {
+      sender: "assistant",
+      text: fullAnswerText
+    });
 
     const sources = retrievedDocs.map(doc => ({
       fileName: doc.metadata.fileName,
@@ -4298,26 +4486,6 @@ ${memoryInstructionBlock ? `\n⚠️ INSTRUÇÕES SOBREPOSTAS DA CONVERSA:\n${me
       secao: doc.metadata.secao,
       score: typeof doc.metadata.distancia === "number" ? Math.max(0, 1 - doc.metadata.distancia) : 1.0
     }));
-
-    // O SERVIDOR monta essa linha a partir dos chunks realmente enviados no contexto (arquivo › seção, sem repetir) e a anexa ao final da resposta
-    if (sources.length > 0 && !fullAnswerText.includes("[[SEM_INFORMACAO]]")) {
-      const uniqueSources = Array.from(new Set(sources.map(s => {
-        const sec = s.secao ? ` › ${s.secao}` : "";
-        return `${s.fileName}${sec}`;
-      })));
-      if (uniqueSources.length > 0) {
-        fullAnswerText = fullAnswerText.replace(/\n*Fontes:.*$/is, "").trim();
-        const sourcesLine = `\n\nFontes: ${uniqueSources.join("; ")}`;
-        fullAnswerText += sourcesLine;
-        res.write(`data: ${JSON.stringify({ text: sourcesLine })}\n\n`);
-      }
-    }
-
-    // Salva a resposta completa final no Firestore
-    await saveChatMessage(resolvedUserEmail, activeSessionId, {
-      sender: "assistant",
-      text: fullAnswerText
-    });
 
     // Envia evento final com metadados e fontes
     res.write(`data: ${JSON.stringify({ done: true, sources })}\n\n`);
